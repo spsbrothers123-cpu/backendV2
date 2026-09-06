@@ -1,0 +1,22 @@
+-- Phase 2: add `branchName` to `users`, backing the new "Branch Name"
+-- field on the Cashier signup form (Cashier2_0 SignupPage) and its
+-- display on the Admin Cashier section.
+--
+-- Nullable and backward-compatible on purpose:
+--   * Existing cashier/admin rows get NULL — no data is touched, nothing
+--     is backfilled or guessed.
+--   * NOT NULL is intentionally NOT enforced at the database level; the
+--     "required for new cashier registrations" rule lives in the
+--     application layer (routes/auth.ts registerSchema), the same place
+--     that already enforces name/email/password requiredness. This keeps
+--     the migration safe to run against a database with existing rows.
+--
+-- NOTE: this migration was authored by hand (not via `prisma migrate dev`)
+-- because this environment's network egress does not allow downloading
+-- Prisma's schema-engine binary. Before applying against a real database,
+-- run `npx prisma migrate diff --from-migrations prisma/migrations
+-- --to-schema-datamodel prisma/schema.prisma --script` (with network
+-- access) to confirm this SQL matches what Prisma itself would generate,
+-- then `npx prisma migrate dev` to record it normally.
+
+ALTER TABLE "users" ADD COLUMN IF NOT EXISTS "branchName" TEXT;

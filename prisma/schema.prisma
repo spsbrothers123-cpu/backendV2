@@ -1,0 +1,647 @@
+// Egg Mart POS — Unified Backend — Phase 1 schema
+// One database, one User table shared by Admin + Cashier roles.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+enum Role {
+  ADMIN
+  CASHIER
+}
+
+// Conceptual account lifecycle. Admins are created ACTIVE (via seed / another
+// admin); cashiers go straight from signup (gated by an admin-issued
+// invitation code — see InvitationCode) to admin-approval.
+enum AccountStatus {
+  PENDING_ADMIN_APPROVAL
+  ACTIVE
+  REJECTED
+  SUSPENDED
+}
+
+// Lifecycle of an admin-generated 6-digit cashier invitation code.
+enum InvitationCodeStatus {
+  ACTIVE
+  USED
+  EXPIRED
+  REVOKED
+}
+
+enum AuditAction {
+  LOGIN
+  LOGOUT
+  LOGIN_FAILED
+  CASHIER_SIGNUP_REQUESTED
+  CASHIER_APPROVED
+  CASHIER_REJECTED
+  CASHIER_UPDATED
+  CASHIER_STATUS_CHANGED
+  INVITATION_CODE_GENERATED
+  INVITATION_CODE_REVOKED
+  INVITATION_CODE_USED
+
+  // ── Phase 2 ───────────────────────────────────────────
+  SESSION_OPENED
+  SESSION_CLOSED
+  PRODUCT_CREATED
+  PRODUCT_UPDATED
+  PRODUCT_DELETED
+  CUSTOMER_CREATED
+  CUSTOMER_UPDATED
+  BILL_CREATED
+  BILL_HELD
+  BILL_RESUMED
+  BILL_HELD_DELETED
+  PAYMENT_CREATED
+  SPLIT_PAYMENT_CREATED
+  CREDIT_PAYMENT_CREATED
+  INVENTORY_ADJUSTED
+  PURCHASE_CREATED
+  EXPENSE_CREATED
+  EXPENSE_UPDATED
+  EXPENSE_DELETED
+  PROFILE_UPDATED
+  SETTINGS_UPDATED
+}
+
+// ── Phase 2 enums ─────────────────────────────────────────────────────
+
+enum ProductUnit {
+  KG
+  G
+  LITRE
+  ML
+  PIECE
+  TRAY
+  BOX
+}
+
+enum ProductStatus {
+  ACTIVE
+  INACTIVE
+}
+
+enum CashierSessionStatus {
+  OPEN
+  CLOSED
+}
+
+enum BillStatus {
+  HELD
+  PAID
+  CANCELLED
+}
+
+enum PaymentMethod {
+  CASH
+  CARD
+  UPI
+  CREDIT
+}
+
+enum CreditTxnType {
+  CHARGE
+  COLLECTION
+}
+
+enum StockMovementType {
+  IN
+  OUT
+  ADJUSTMENT
+}
+
+enum NotificationType {
+  LOW_STOCK
+  PAYMENT_PENDING
+  SESSION_EVENT
+  SYSTEM
+}
+
+enum PurchaseStatus {
+  RECEIVED
+  PENDING
+  CANCELLED
+}
+
+model Shop {
+  id        String   @id @default(uuid())
+  name      String
+  code      String   @unique
+  address   String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  users     User[]
+  auditLogs AuditLog[]
+
+  products         Product[]
+  customers        Customer[]
+  cashierSessions  CashierSession[]
+  bills            Bill[]
+  creditTxns       CreditTransaction[]
+  inventoryMoves   InventoryMovement[]
+  purchases        Purchase[]
+  expenses         Expense[]
+  billCounters     BillCounter[]
+  notifications    Notification[]
+  settings         ShopSettings?
+  invitationCodes  InvitationCode[]
+
+  @@map("shops")
+}
+
+// Admin-generated 6-digit cashier signup invitation code. Replaces the old
+// cashier-signup email OTP flow entirely — see routes/auth.ts and
+// routes/admin/invitationCodes.ts. Only one ACTIVE code exists per shop at
+// a time (generating a new one revokes the previous one).
+//
+// The code itself is only ever stored hashed (codeHash, SHA-256) for
+// verification. `codePlain` is a deliberate, narrow exception: the Admin
+// UI needs to re-display the still-valid code after a page refresh
+// (GET /admin/invitation-codes/active), not just at the moment it was
+// generated. So `codePlain` is populated only while status is ACTIVE and
+// is wiped (set back to null) the instant the code stops being ACTIVE
+// (used, revoked, or found expired) — it never leaks through any
+// list/history endpoint, only through the single "current active code"
+// endpoint, and only to the admin of the owning shop.
+model InvitationCode {
+  id     String @id @default(uuid())
+  shopId String
+  shop   Shop   @relation(fields: [shopId], references: [id])
+
+  codeHash  String
+  codePlain String?
+
+  status    InvitationCodeStatus @default(ACTIVE)
+  expiresAt DateTime
+  usedAt    DateTime?
+
+  createdByAdminId String
+  createdByAdmin   User   @relation("InvitationCodesCreated", fields: [createdByAdminId], references: [id])
+
+  // Set to the cashier User created via this code, once used — lets the
+  // Admin cashier-requests list show a masked reference to which code a
+  // given signup request came from (see User.invitationCodeMasked).
+  usedByUserId String? @unique
+  usedByUser   User?   @relation("InvitationCodeUsedBy", fields: [usedByUserId], references: [id])
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([shopId])
+  @@index([codeHash])
+  @@index([status])
+  @@map("invitation_codes")
+}
+
+// One row per shop, holding everything shown on the Admin app's Settings
+// page. Free-form settings groups (tax/billing, appearance, POS, security)
+// are stored as JSON so new fields can be added there without a migration;
+// the handful of fields the Admin "General" tab treats as core shop
+// identity (gstin, contact info) get real columns.
+model ShopSettings {
+  id     String @id @default(uuid())
+  shopId String @unique
+  shop   Shop   @relation(fields: [shopId], references: [id])
+
+  gstin        String?
+  contactPhone String?
+  contactEmail String?
+
+  taxBilling Json @default("{}")
+  appearance Json @default("{}")
+  pos        Json @default("{}")
+  security   Json @default("{}")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("shop_settings")
+}
+
+// Admin-facing notification feed (low stock alerts, pending credit
+// payments, session open/close events, system messages). Cashier app
+// does not read this model.
+model Notification {
+  id     String           @id @default(uuid())
+  shopId String
+  shop   Shop             @relation(fields: [shopId], references: [id])
+
+  type    NotificationType
+  title   String
+  message String
+  read    Boolean          @default(false)
+
+  createdAt DateTime @default(now())
+
+  @@index([shopId, read, createdAt])
+  @@map("notifications")
+}
+
+model User {
+  id       String @id @default(uuid())
+  name     String
+  email    String @unique
+  phone    String?
+  passwordHash String
+
+  role   Role
+  status AccountStatus @default(ACTIVE)
+
+  shopId String?
+  shop   Shop?   @relation(fields: [shopId], references: [id])
+
+  approvedAt DateTime?
+  approvedBy String?
+  rejectedAt DateTime?
+  rejectedBy String?
+  rejectionReason String?
+
+  lastLoginAt DateTime?
+
+  // Masked reference (e.g. "••••31") to the invitation code a cashier
+  // signed up with — set once, at registration, from InvitationCode.
+  // The full code is never recoverable from this. Null for admins and
+  // for any cashier row created outside the invitation-code flow (e.g.
+  // seeded).
+  invitationCodeMasked String?
+
+  // Phase 2: the branch/location a cashier registered under (collected as
+  // a new required field on the cashier signup form). Nullable at the
+  // schema level — existing cashiers created before this field existed
+  // have no branch on file — but required by the signup endpoint for
+  // every NEW cashier registration (see routes/auth.ts registerSchema).
+  // Null for admins, who aren't tied to a single branch.
+  branchName String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  sessions            Session[]
+  auditLogs           AuditLog[] @relation("ActorAuditLogs")
+  invitationCodesCreated InvitationCode[] @relation("InvitationCodesCreated")
+  invitationCodeUsed     InvitationCode?  @relation("InvitationCodeUsedBy")
+
+  cashierSessions     CashierSession[]
+  billsAsCashier      Bill[]              @relation("CashierBills")
+  inventoryMoves      InventoryMovement[]
+  purchasesCreated    Purchase[]
+  expensesCreated     Expense[]
+  creditTxnsActed     CreditTransaction[]
+
+  @@index([role, status])
+  @@index([shopId])
+  @@map("users")
+}
+
+// Lightweight session record so logout / suspension can revoke an
+// already-issued JWT rather than relying on expiry alone.
+model Session {
+  id     String @id @default(uuid())
+  jti    String @unique
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  userAgent String?
+  ip        String?
+
+  createdAt DateTime  @default(now())
+  expiresAt DateTime
+  revokedAt DateTime?
+
+  @@index([userId])
+  @@map("sessions")
+}
+
+model AuditLog {
+  id     String      @id @default(uuid())
+  action AuditAction
+
+  actorId String?
+  actor   User?   @relation("ActorAuditLogs", fields: [actorId], references: [id])
+  actorRole Role?
+
+  shopId String?
+  shop   Shop?   @relation(fields: [shopId], references: [id])
+
+  entityType String?
+  entityId   String?
+
+  metadata Json?
+
+  createdAt DateTime @default(now())
+
+  @@index([action, createdAt])
+  @@index([actorId])
+  @@map("audit_logs")
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// PHASE 2 — Products, Customers, Sessions, Billing, Payments, Inventory,
+// Purchases, Expenses. One database, shared by Admin + Cashier frontends.
+// ═══════════════════════════════════════════════════════════════════════
+
+model Product {
+  id                String        @id @default(uuid())
+  shopId            String
+  shop              Shop          @relation(fields: [shopId], references: [id])
+
+  name              String
+  category          String
+  sku               String?
+  barcode           String?
+
+  // Money: always NUMERIC, never float — see lib/money.ts.
+  sellingPrice      Decimal       @db.Decimal(12, 2)
+  costPrice         Decimal?      @db.Decimal(12, 2)
+
+  stock             Int           @default(0)
+  unit              ProductUnit
+  lowStockThreshold Int           @default(0)
+  status            ProductStatus @default(ACTIVE)
+
+  createdAt         DateTime      @default(now())
+  updatedAt         DateTime      @updatedAt
+
+  billItems         BillItem[]
+  inventoryMoves    InventoryMovement[]
+  purchaseItems     PurchaseItem[]
+
+  @@index([shopId, status])
+  @@index([shopId, category])
+  @@unique([shopId, barcode])
+  @@map("products")
+}
+
+model Customer {
+  id             String     @id @default(uuid())
+  shopId         String
+  shop           Shop       @relation(fields: [shopId], references: [id])
+
+  name           String
+  phone          String
+
+  // Running balance owed by this customer. Increased by CHARGE credit
+  // transactions (credit sales), decreased by COLLECTION transactions.
+  // Always the sum of CreditTransaction rows for this customer — kept as
+  // a denormalized column, updated only inside the same DB transaction
+  // that creates the corresponding CreditTransaction row.
+  creditBalance  Decimal    @default(0) @db.Decimal(12, 2)
+
+  createdAt      DateTime   @default(now())
+  updatedAt      DateTime   @updatedAt
+
+  bills          Bill[]
+  creditTxns     CreditTransaction[]
+
+  @@index([shopId])
+  @@unique([shopId, phone])
+  @@map("customers")
+}
+
+// One row per bill-number sequence bucket (per shop per year). Incremented
+// atomically via a single upsert statement — see lib/billNumber.ts — so
+// concurrent checkouts can never collide on the same bill number.
+model BillCounter {
+  id     String @id @default(uuid())
+  shopId String
+  shop   Shop   @relation(fields: [shopId], references: [id])
+  year   Int
+  seq    Int    @default(0)
+
+  @@unique([shopId, year])
+  @@map("bill_counters")
+}
+
+model CashierSession {
+  id                  String               @id @default(uuid())
+  cashierId           String
+  cashier             User                 @relation(fields: [cashierId], references: [id])
+  shopId              String
+  shop                Shop                 @relation(fields: [shopId], references: [id])
+
+  status              CashierSessionStatus @default(OPEN)
+  openingCash         Decimal              @db.Decimal(12, 2)
+  actualClosingCash   Decimal?             @db.Decimal(12, 2)
+
+  openedAt            DateTime             @default(now())
+  closedAt            DateTime?
+
+  bills               Bill[]
+
+  @@index([cashierId, status])
+  @@index([shopId])
+  @@map("cashier_sessions")
+}
+
+model Bill {
+  id             String         @id @default(uuid())
+  shopId         String
+  shop           Shop           @relation(fields: [shopId], references: [id])
+  cashierId      String
+  cashier        User           @relation("CashierBills", fields: [cashierId], references: [id])
+  sessionId      String?
+  session        CashierSession? @relation(fields: [sessionId], references: [id])
+  customerId     String?
+  customer       Customer?      @relation(fields: [customerId], references: [id])
+
+  billNumber     String?        @unique
+  label          String?
+
+  subtotal       Decimal        @db.Decimal(12, 2)
+  discount       Decimal        @default(0) @db.Decimal(12, 2)
+  tax            Decimal        @default(0) @db.Decimal(12, 2)
+  grandTotal     Decimal        @db.Decimal(12, 2)
+
+  status         BillStatus     @default(HELD)
+
+  // Idempotency: replaying the same key (per shop) returns the original
+  // bill instead of creating a duplicate. Unique so a race between two
+  // identical requests can only ever insert one row.
+  idempotencyKey String?
+
+  createdAt      DateTime       @default(now())
+  heldAt         DateTime?
+  paidAt         DateTime?
+  cancelledAt    DateTime?
+
+  items          BillItem[]
+  payments       Payment[]
+  creditTxns     CreditTransaction[]
+
+  @@unique([shopId, idempotencyKey])
+  @@index([shopId, status, createdAt])
+  @@index([cashierId])
+  @@index([customerId])
+  @@map("bills")
+}
+
+model BillItem {
+  id          String   @id @default(uuid())
+  billId      String
+  bill        Bill     @relation(fields: [billId], references: [id], onDelete: Cascade)
+  productId   String
+  product     Product  @relation(fields: [productId], references: [id])
+
+  // Snapshot the product's name/unit/price at time of sale so historical
+  // bills never change if the product is later renamed or re-priced.
+  productName String
+  unit        String
+  quantity    Int
+  unitPrice   Decimal  @db.Decimal(12, 2)
+  lineTotal   Decimal  @db.Decimal(12, 2)
+
+  @@index([billId])
+  @@map("bill_items")
+}
+
+model Payment {
+  id            String        @id @default(uuid())
+  billId        String
+  bill          Bill          @relation(fields: [billId], references: [id], onDelete: Cascade)
+
+  method        PaymentMethod
+  amount        Decimal       @db.Decimal(12, 2)
+  reference     String?
+  cashReceived  Decimal?      @db.Decimal(12, 2)
+  change        Decimal?      @db.Decimal(12, 2)
+
+  createdAt     DateTime      @default(now())
+
+  @@index([billId])
+  @@map("payments")
+}
+
+// One row per credit charge (a CREDIT-method bill) and per collection
+// (partial/full payment against outstanding balance). customer.creditBalance
+// is the running total; this table is the append-only ledger behind it.
+model CreditTransaction {
+  id         String        @id @default(uuid())
+  shopId     String
+  shop       Shop          @relation(fields: [shopId], references: [id])
+  customerId String
+  customer   Customer      @relation(fields: [customerId], references: [id])
+  billId     String?
+  bill       Bill?         @relation(fields: [billId], references: [id])
+
+  type       CreditTxnType
+  amount     Decimal       @db.Decimal(12, 2)
+  method     PaymentMethod?
+  reference  String?
+  notes      String?
+
+  actorId    String?
+  actor      User?         @relation(fields: [actorId], references: [id])
+
+  createdAt  DateTime      @default(now())
+
+  @@index([customerId, createdAt])
+  @@index([shopId])
+  @@map("credit_transactions")
+}
+
+model InventoryMovement {
+  id            String            @id @default(uuid())
+  shopId        String
+  shop          Shop              @relation(fields: [shopId], references: [id])
+  productId     String
+  product       Product           @relation(fields: [productId], references: [id])
+
+  type          StockMovementType
+  // Signed delta: positive for IN/increase, negative for OUT/decrease.
+  quantity      Int
+  previousStock Int
+  newStock      Int
+  reason        String
+
+  actorId       String?
+  actor         User?             @relation(fields: [actorId], references: [id])
+
+  createdAt     DateTime          @default(now())
+
+  @@index([shopId, createdAt])
+  @@index([productId])
+  @@map("inventory_movements")
+}
+
+model Purchase {
+  id            String         @id @default(uuid())
+  shopId        String
+  shop          Shop           @relation(fields: [shopId], references: [id])
+
+  supplierName  String
+  invoiceNumber String
+  purchaseDate  DateTime
+
+  subtotal      Decimal        @db.Decimal(12, 2)
+  tax           Decimal        @default(0) @db.Decimal(12, 2)
+  grandTotal    Decimal        @db.Decimal(12, 2)
+  status        PurchaseStatus @default(RECEIVED)
+
+  createdById   String?
+  createdBy     User?          @relation(fields: [createdById], references: [id])
+
+  createdAt     DateTime       @default(now())
+
+  items         PurchaseItem[]
+
+  @@index([shopId, createdAt])
+  @@map("purchases")
+}
+
+model PurchaseItem {
+  id            String      @id @default(uuid())
+  purchaseId    String
+  purchase      Purchase    @relation(fields: [purchaseId], references: [id], onDelete: Cascade)
+
+  // Nullable = the Phase 2 "purchase-only item" discriminator. Present ->
+  // this line references a real, permanent Product Catalog row (Option 1,
+  // "Add Product in Catalog"). Null -> this line was added via Option 2,
+  // "Add to Purchase List — Not in Catalog": it exists only on this
+  // purchase, never became a Product row, never touches inventory, and is
+  // never visible to Cashier POS or the Product Catalog. See
+  // routes/admin/purchases.ts.
+  productId     String?
+  product       Product?    @relation(fields: [productId], references: [id])
+
+  // Always populated (for both catalog and purchase-only items) so this
+  // row is a self-contained snapshot — Purchase History, Purchase Details,
+  // and Purchase Export read these columns directly and never need to
+  // join Product, so they keep working unchanged for both item kinds and
+  // never break if a catalog product is later renamed.
+  productName   String
+  quantity      Int
+  unit          ProductUnit
+  purchasePrice Decimal     @db.Decimal(12, 2)
+  total         Decimal     @db.Decimal(12, 2)
+
+  @@index([purchaseId])
+  @@index([productId])
+  @@map("purchase_items")
+}
+
+model Expense {
+  id          String   @id @default(uuid())
+  shopId      String
+  shop        Shop     @relation(fields: [shopId], references: [id])
+
+  date        DateTime
+  category    String
+  description String
+  amount      Decimal  @db.Decimal(12, 2)
+
+  createdById String?
+  createdBy   User?    @relation(fields: [createdById], references: [id])
+
+  createdAt   DateTime @default(now())
+
+  @@index([shopId, date])
+  @@map("expenses")
+}
