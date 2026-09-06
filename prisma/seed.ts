@@ -19,7 +19,7 @@ async function main() {
 
   const passwordHash = await bcrypt.hash(adminPassword, 12);
 
-  await prisma.user.upsert({
+  const admin = await prisma.user.upsert({
     where: { email: adminEmail },
     update: {},
     create: {
@@ -30,6 +30,17 @@ async function main() {
       status: "ACTIVE",
       shopId: shop.id,
     },
+  });
+
+  // Multi-shop foundation (RBR Egg Mart Phase 1): link the seeded admin to
+  // the seeded shop, same as a real admin signup would. Not strictly
+  // required — src/lib/shopAccess.ts self-heals this on first access — but
+  // keeps freshly-seeded dev/test data consistent with a real signup from
+  // the start.
+  await prisma.adminShopLink.upsert({
+    where: { adminId_shopId: { adminId: admin.id, shopId: shop.id } },
+    update: {},
+    create: { adminId: admin.id, shopId: shop.id },
   });
 
   // ── Phase 2 demo data — a handful of products and customers so both

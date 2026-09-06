@@ -11,6 +11,7 @@ import authRoutes from "./routes/auth.js";
 import cashierRequestsRoutes from "./routes/admin/cashierRequests.js";
 import cashiersRoutes from "./routes/admin/cashiers.js";
 import adminInvitationCodesRoutes from "./routes/admin/invitationCodes.js";
+import adminShopsRoutes from "./routes/admin/shops.js";
 
 // Cashier-facing (bare paths — matches the Cashier app's stub API contract)
 import productsRoutes from "./routes/products.js";
@@ -71,6 +72,7 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(cashierRequestsRoutes, { prefix: "/api/admin/cashier-requests" });
   await app.register(cashiersRoutes, { prefix: "/api/admin/cashiers" });
   await app.register(adminInvitationCodesRoutes, { prefix: "/api/admin/invitation-codes" });
+  await app.register(adminShopsRoutes, { prefix: "/api/admin/shops" });
 
   // Phase 2 — Cashier app
   await app.register(productsRoutes, { prefix: "/api/products" });

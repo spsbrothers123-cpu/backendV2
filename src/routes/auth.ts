@@ -10,6 +10,7 @@ import { recordAudit } from "../lib/audit.js";
 import { issueSession, revokeSession } from "../lib/session.js";
 import { toPublicAdminUser, toPublicCashier } from "../lib/serializers.js";
 import { env } from "../config/env.js";
+import { resolveOrCreateShopByLocation, ensureAdminShopLink } from "../lib/shopAccess.js";
 
 const emailSchema = z.string().trim().min(1, "Email is required.").email("Enter a valid email address.");
 
@@ -40,6 +41,18 @@ const registerSchema = z.object({
 
 const signupStatusQuerySchema = z.object({
   requestId: z.string().trim().min(1, "requestId is required."),
+});
+
+// ── Admin signup — multi-shop foundation (RBR Egg Mart Phase 1) ─────────
+// Unlike cashier signup, there was no admin signup endpoint at all before
+// this (admins were only ever created via prisma/seed.ts). See this
+// repo's README, "Multi-shop foundation", for why this design was chosen
+// over reinterpreting the existing invitation-code cashier signup.
+const adminSignupSchema = z.object({
+  name: z.string().trim().min(1, "Name is required.").max(120),
+  email: emailSchema,
+  password: z.string().min(1, "Password is required."),
+  shopLocation: z.string().trim().min(1, "Shop location is required.").max(120),
 });
 
 export default async function authRoutes(fastify: FastifyInstance) {
@@ -285,6 +298,133 @@ export default async function authRoutes(fastify: FastifyInstance) {
       });
 
       return { token, cashier: toPublicCashier(user) };
+    }
+  );
+
+  // ── POST /api/auth/admin/signup — create/extend an Admin account ────
+  // Body: { name, email, password, shopLocation }. Resolves-or-creates the
+  // Shop for shopLocation (dedup by normalized location — Phase 1 spec
+  // §2/§3) and links it to the admin.
+  //
+  // Two cases, both handled here so "a single Admin can manage multiple
+  // shops" (Phase 1 spec §objective) doesn't require a second endpoint:
+  //   - New email → creates a new ADMIN user, active immediately (matching
+  //     this app's existing "admins aren't approval-gated" policy), with
+  //     this as their first/active shop.
+  //   - Email already belongs to an ACTIVE admin, password matches → adds
+  //     this shop to that admin's owned set (AdminShopLink) WITHOUT
+  //     creating a second account and WITHOUT changing which shop is
+  //     currently their active one (see POST /admin/shops/switch for
+  //     that). Password is re-checked here specifically because this
+  //     endpoint is unauthenticated — knowing someone's admin email alone
+  //     must never be enough to attach a shop to their account.
+  // An email belonging to a CASHIER, or a wrong password on an existing
+  // admin email, is rejected the same way (no hint as to which).
+  fastify.post(
+    "/admin/signup",
+    { config: { rateLimit: { max: 10, timeWindow: "10 minutes" } } },
+    async (request, reply) => {
+      const body = parseBody(adminSignupSchema, request.body);
+
+      if (!isPasswordStrongEnough(body.password)) {
+        throw Errors.validation("Password must be at least 8 characters and include a letter and a number.");
+      }
+
+      const existing = await prisma.user.findUnique({ where: { email: body.email } });
+
+      if (existing && existing.role !== "ADMIN") {
+        throw Errors.conflict("An account with this email already exists.", "ACCOUNT_ALREADY_EXISTS");
+      }
+
+      if (existing) {
+        const passwordOk = await verifyPassword(body.password, existing.passwordHash);
+        if (!passwordOk) {
+          throw Errors.unauthorized("Invalid email or password.", "INVALID_CREDENTIALS");
+        }
+        if (existing.status !== "ACTIVE") {
+          throw Errors.forbidden("This admin account is not active.", "ACCOUNT_NOT_ACTIVE");
+        }
+      }
+
+      const passwordHash = existing ? existing.passwordHash : await hashPassword(body.password);
+
+      // Not wrapped in a single DB transaction: resolveOrCreateShopByLocation
+      // and ensureAdminShopLink are each independently race-safe (unique
+      // constraint + catch-and-refetch — see shopAccess.ts), so sequencing
+      // them plainly is both simpler and no less safe than a transaction
+      // that couldn't actually span them atomically anyway.
+      const { shop, created: shopCreated } = await resolveOrCreateShopByLocation(body.shopLocation);
+
+      const admin = existing
+        ? existing
+        : await prisma.user
+            .create({
+              data: {
+                name: body.name,
+                email: body.email,
+                passwordHash,
+                role: "ADMIN",
+                status: "ACTIVE",
+                shopId: shop.id,
+              },
+            })
+            // Two simultaneous signups for the same brand-new email: the
+            // loser hits the unique constraint on email rather than a
+            // generic 500 (mirrors the "account already exists" message
+            // the earlier findUnique check would have given the loser had
+            // it run a moment later).
+            .catch(() => {
+              throw Errors.conflict("An account with this email already exists.", "ACCOUNT_ALREADY_EXISTS");
+            });
+
+      const { linked } = await ensureAdminShopLink(admin.id, shop.id);
+
+      const result = { admin, shop, shopCreated, linked, isNewAdmin: !existing };
+
+      if (result.isNewAdmin) {
+        await recordAudit({
+          action: "ADMIN_SIGNUP",
+          actorId: result.admin.id,
+          actorRole: "ADMIN",
+          shopId: result.shop.id,
+          entityType: "User",
+          entityId: result.admin.id,
+        });
+      }
+      if (result.shopCreated) {
+        await recordAudit({
+          action: "SHOP_CREATED",
+          actorId: result.admin.id,
+          actorRole: "ADMIN",
+          shopId: result.shop.id,
+          entityType: "Shop",
+          entityId: result.shop.id,
+        });
+      }
+      if (result.linked && !result.isNewAdmin) {
+        await recordAudit({
+          action: "SHOP_LINKED",
+          actorId: result.admin.id,
+          actorRole: "ADMIN",
+          shopId: result.shop.id,
+          entityType: "Shop",
+          entityId: result.shop.id,
+        });
+      }
+
+      const token = await issueSession(result.admin.id, "ADMIN", request);
+      await prisma.user.update({ where: { id: result.admin.id }, data: { lastLoginAt: new Date() } });
+
+      return reply.code(result.isNewAdmin ? 201 : 200).send({
+        token,
+        user: toPublicAdminUser(result.admin),
+        shop: {
+          id: result.shop.id,
+          name: result.shop.name,
+          code: result.shop.code,
+          location: result.shop.location,
+        },
+      });
     }
   );
 

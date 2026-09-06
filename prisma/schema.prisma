@@ -48,6 +48,12 @@ enum AuditAction {
   INVITATION_CODE_USED
 
   // ── Phase 2 ───────────────────────────────────────────
+  // ── Multi-shop foundation (RBR Egg Mart Phase 1) ────────────────────
+  ADMIN_SIGNUP
+  SHOP_CREATED
+  SHOP_LINKED
+  SHOP_SWITCHED
+
   SESSION_OPENED
   SESSION_CLOSED
   PRODUCT_CREATED
@@ -135,6 +141,17 @@ model Shop {
   name      String
   code      String   @unique
   address   String?
+
+  // Multi-shop foundation (RBR Egg Mart Phase 1): the raw branch/area name
+  // a shop was identified and named from at signup time, e.g. "Veerapandi"
+  // (name then becomes "RBR Egg Mart - Veerapandi" — see
+  // src/lib/shopAccess.ts). Deliberately separate from `address`, which is
+  // the free-text mailing address editable on the Admin Settings page —
+  // two different concepts that happened to share a name in the spec doc.
+  // Nullable: the legacy seeded shop (and any shop created before this
+  // field existed) has no location on file.
+  location  String?
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -154,7 +171,37 @@ model Shop {
   settings         ShopSettings?
   invitationCodes  InvitationCode[]
 
+  // Multi-shop foundation: which Admin(s) own/manage this shop. A row here
+  // is the source of truth for shop access — see AdminShopLink below.
+  adminLinks       AdminShopLink[]
+
   @@map("shops")
+}
+
+// Multi-shop foundation (RBR Egg Mart Phase 1). A single Admin User can own
+// several Shops (one row per admin/shop pair) — this is what makes "Admin A
+// manages Veerapandi, Gandhipuram, and Singanallur" representable, since
+// User.shopId is a single scalar (it's "this account's current/active
+// shop", not the full set they're allowed to access).
+//
+// Existing single-shop admins (seeded, or created before this table
+// existed) have no row here yet. Nothing backfills them via migration —
+// src/lib/shopAccess.ts (assertAdminOwnsShop / listShopsForAdmin) lazily
+// creates the missing link the first time that admin's shop access is
+// checked, falling back to "does user.shopId already equal this shop"
+// during the gap. This keeps the migration purely additive.
+model AdminShopLink {
+  id      String @id @default(uuid())
+  adminId String
+  admin   User   @relation(fields: [adminId], references: [id], onDelete: Cascade)
+  shopId  String
+  shop    Shop   @relation(fields: [shopId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  @@unique([adminId, shopId])
+  @@index([shopId])
+  @@map("admin_shop_links")
 }
 
 // Admin-generated 6-digit cashier signup invitation code. Replaces the old
@@ -288,6 +335,11 @@ model User {
   auditLogs           AuditLog[] @relation("ActorAuditLogs")
   invitationCodesCreated InvitationCode[] @relation("InvitationCodesCreated")
   invitationCodeUsed     InvitationCode?  @relation("InvitationCodeUsedBy")
+
+  // Multi-shop foundation: every shop this User (in practice, an ADMIN)
+  // owns/manages. Empty for cashiers and for admins not yet self-healed
+  // into the table — see AdminShopLink's doc comment.
+  shopLinks           AdminShopLink[]
 
   cashierSessions     CashierSession[]
   billsAsCashier      Bill[]              @relation("CashierBills")

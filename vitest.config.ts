@@ -12,6 +12,11 @@ export default defineConfig({
     //   RUN_INTEGRATION_TESTS=1 npx vitest run test/billing.integration.test.ts
     exclude: process.env.RUN_INTEGRATION_TESTS
       ? ["node_modules/**"]
-      : ["node_modules/**", "test/auth.integration.test.ts", "test/billing.integration.test.ts"],
+      : [
+          "node_modules/**",
+          "test/auth.integration.test.ts",
+          "test/billing.integration.test.ts",
+          "test/adminShops.integration.test.ts",
+        ],
   },
 });
