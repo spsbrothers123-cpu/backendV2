@@ -38,12 +38,17 @@ async function adminSignup(payload: {
   password: string;
   shopLocation: string;
 }) {
-  return app.inject({
-    method: "POST",
-    url: "/api/auth/admin/signup",
-    payload: { name: payload.name ?? "Admin", ...payload },
-  });
-}
++  const res = await app.inject({
+     method: "POST",
+     url: "/api/auth/admin/signup",
+     payload: { name: payload.name ?? "Admin", ...payload },
+   });
++  if (res.statusCode >= 400) {
++    throw new Error(`adminSignup failed (${res.statusCode}): ${res.payload}`);
++  }
++  return res;
+ }
+
 
 describe("Admin signup — multi-shop foundation", () => {
   it("creates a new admin and a new shop named 'RBR Egg Mart - <Location>'", async () => {

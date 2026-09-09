@@ -1,5 +1,6 @@
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
+import { Prisma } from "@prisma/client";
 import { prisma } from "../lib/prisma.js";
 import { Errors } from "../lib/errors.js";
 import { parseBody } from "../lib/validate.js";
@@ -55,6 +56,15 @@ const adminSignupSchema = z.object({
   shopLocation: z.string().trim().min(1, "Shop location is required.").max(120),
 });
 
+// In test runs, dozens of auth calls land in the same file's in-memory
+// rate-limit bucket (one Fastify instance per file, one client IP via
+// app.inject()), so the per-route limits below — sized for real abuse —
+// would otherwise starve the test suite itself. Production behavior is
+// untouched: `rateLimit: false` is @fastify/rate-limit's documented
+// per-route opt-out, applied only when NODE_ENV === "test".
+const authRateLimit = (max: number, timeWindow: string) =>
+  env.NODE_ENV === "test" ? { rateLimit: false as const } : { rateLimit: { max, timeWindow } };
+
 export default async function authRoutes(fastify: FastifyInstance) {
   // ── POST /api/auth/signup/verify-invitation — cashier signup, step 1 ──
   // Validates an admin-issued 6-digit invitation code and, if valid,
@@ -63,7 +73,7 @@ export default async function authRoutes(fastify: FastifyInstance) {
   // source of truth (Backend spec §9).
   fastify.post(
     "/signup/verify-invitation",
-    { config: { rateLimit: { max: 5, timeWindow: "10 minutes" } } },
+    { config: authRateLimit(5, "10 minutes") },
     async (request) => {
       const body = parseBody(verifyInvitationSchema, request.body);
       const codeHash = hashInvitationCode(body.code);
@@ -114,7 +124,7 @@ export default async function authRoutes(fastify: FastifyInstance) {
   // ── POST /api/auth/signup — cashier signup, step 2 ───────────────────
   fastify.post(
     "/signup",
-    { config: { rateLimit: { max: 10, timeWindow: "10 minutes" } } },
+    { config: authRateLimit(10, "10 minutes") },
     async (request, reply) => {
       const body = parseBody(registerSchema, request.body);
 
@@ -262,7 +272,7 @@ export default async function authRoutes(fastify: FastifyInstance) {
   // ── POST /api/auth/login — cashier login (no OTP, no invitation code) ─
   fastify.post(
     "/login",
-    { config: { rateLimit: { max: 20, timeWindow: "10 minutes" } } },
+    { config: authRateLimit(20, "10 minutes") },
     async (request) => {
       const body = parseBody(loginSchema, request.body);
       const user = await prisma.user.findUnique({ where: { email: body.email }, include: { shop: true } });
@@ -322,7 +332,7 @@ export default async function authRoutes(fastify: FastifyInstance) {
   // admin email, is rejected the same way (no hint as to which).
   fastify.post(
     "/admin/signup",
-    { config: { rateLimit: { max: 10, timeWindow: "10 minutes" } } },
+    { config: authRateLimit(10, "10 minutes") },
     async (request, reply) => {
       const body = parseBody(adminSignupSchema, request.body);
 
@@ -373,8 +383,11 @@ export default async function authRoutes(fastify: FastifyInstance) {
             // generic 500 (mirrors the "account already exists" message
             // the earlier findUnique check would have given the loser had
             // it run a moment later).
-            .catch(() => {
-              throw Errors.conflict("An account with this email already exists.", "ACCOUNT_ALREADY_EXISTS");
+             .catch((err) => {
+              if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002") {
+                throw Errors.conflict("An account with this email already exists.", "ACCOUNT_ALREADY_EXISTS");
+              }
+              throw err;
             });
 
       const { linked } = await ensureAdminShopLink(admin.id, shop.id);
@@ -431,7 +444,7 @@ export default async function authRoutes(fastify: FastifyInstance) {
   // ── POST /api/auth/admin/login ──────────────────────────────────────
   fastify.post(
     "/admin/login",
-    { config: { rateLimit: { max: 20, timeWindow: "10 minutes" } } },
+    { config: authRateLimit(20, "10 minutes") },
     async (request) => {
       const body = parseBody(loginSchema, request.body);
       const user = await prisma.user.findUnique({ where: { email: body.email } });

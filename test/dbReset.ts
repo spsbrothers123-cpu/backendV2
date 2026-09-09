@@ -12,6 +12,13 @@ import { prisma } from "../src/lib/prisma.js";
  * Postgres throws a foreign key constraint violation on the final
  * user/shop deleteMany() below unless its children are already gone.
  *
+ * Wrapped in a single $transaction so the whole reset is atomic — no
+ * other connection can observe (or insert into) a half-wiped DB between
+ * individual deleteMany() calls. Integration tests must also run
+ * serially (see vitest.config.ts: fileParallelism: false, pool: "forks",
+ * singleFork: true) since they share one real Postgres database; this
+ * transaction is defense-in-depth on top of that, not a substitute for it.
+ *
  * This used to be copy-pasted per test file, and every copy had silently
  * fallen out of sync with the schema (missing shopSettings, notification,
  * purchase/purchaseItem, expense — any test that touched those routes
@@ -23,33 +30,35 @@ import { prisma } from "../src/lib/prisma.js";
  * shopId/userId (or other) FK needs a line here, above `user`/`shop`.
  */
 export async function resetDb() {
-  // Deepest children first — bills' own line items/payments/credit
-  // entries, purchase line items — before the rows they belong to.
-  await prisma.billItem.deleteMany();
-  await prisma.payment.deleteMany();
-  await prisma.creditTransaction.deleteMany();
-  await prisma.purchaseItem.deleteMany();
-  await prisma.purchase.deleteMany();
-  await prisma.inventoryMovement.deleteMany();
+  await prisma.$transaction([
+    // Deepest children first — bills' own line items/payments/credit
+    // entries, purchase line items — before the rows they belong to.
+    prisma.billItem.deleteMany(),
+    prisma.payment.deleteMany(),
+    prisma.creditTransaction.deleteMany(),
+    prisma.purchaseItem.deleteMany(),
+    prisma.purchase.deleteMany(),
+    prisma.inventoryMovement.deleteMany(),
 
-  // Bill before cashierSession: Bill.sessionId references CashierSession.
-  await prisma.bill.deleteMany();
-  await prisma.billCounter.deleteMany();
-  await prisma.cashierSession.deleteMany();
+    // Bill before cashierSession: Bill.sessionId references CashierSession.
+    prisma.bill.deleteMany(),
+    prisma.billCounter.deleteMany(),
+    prisma.cashierSession.deleteMany(),
 
-  await prisma.notification.deleteMany();
-  await prisma.expense.deleteMany();
-  await prisma.product.deleteMany();
-  await prisma.customer.deleteMany();
-  await prisma.shopSettings.deleteMany();
+    prisma.notification.deleteMany(),
+    prisma.expense.deleteMany(),
+    prisma.product.deleteMany(),
+    prisma.customer.deleteMany(),
+    prisma.shopSettings.deleteMany(),
 
-  // Auth/access rows.
-  await prisma.session.deleteMany();
-  await prisma.adminShopLink.deleteMany();
-  await prisma.invitationCode.deleteMany();
-  await prisma.auditLog.deleteMany();
+    // Auth/access rows.
+    prisma.session.deleteMany(),
+    prisma.adminShopLink.deleteMany(),
+    prisma.invitationCode.deleteMany(),
+    prisma.auditLog.deleteMany(),
 
-  // User before shop: User.shopId references Shop.
-  await prisma.user.deleteMany();
-  await prisma.shop.deleteMany();
+    // User before shop: User.shopId references Shop.
+    prisma.user.deleteMany(),
+    prisma.shop.deleteMany(),
+  ]);
 }

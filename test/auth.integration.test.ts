@@ -96,7 +96,7 @@ describe("Cashier signup → invitation code → approval → login", () => {
     const signupRes = await app.inject({
       method: "POST",
       url: "/api/auth/signup",
-      payload: { name: "John Doe", email: "john@example.com", password: "password123", verificationToken },
+      payload: { name: "John Doe", email: "john@example.com", password: "password123", branchName: "Test Branch", verificationToken },
     });
     expect(signupRes.statusCode).toBe(201);
     const { requestId, email } = JSON.parse(signupRes.payload);
@@ -174,7 +174,7 @@ describe("Cashier signup → invitation code → approval → login", () => {
     const res = await app.inject({
       method: "POST",
       url: "/api/auth/signup",
-      payload: { name: "Eve", email: "eve@example.com", password: "password123", verificationToken: "not-a-real-token" },
+            payload: { name: "Eve", email: "eve@example.com", password: "password123", branchName: "Test Branch", verificationToken: "not-a-real-token" },
     });
     expect(res.statusCode).toBe(401);
     expect(JSON.parse(res.payload).code).toBe("INVITATION_VERIFICATION_INVALID");
@@ -257,7 +257,7 @@ describe("Cashier signup → invitation code → approval → login", () => {
     const res = await app.inject({
       method: "POST",
       url: "/api/auth/signup",
-      payload: { name: "Existing", email: "existing@example.com", password: "password123", verificationToken },
+            payload: { name: "Existing", email: "existing@example.com", password: "password123", branchName: "Test Branch", verificationToken },
     });
     expect(res.statusCode).toBe(409);
     expect(JSON.parse(res.payload).code).toBe("ACCOUNT_ALREADY_EXISTS");

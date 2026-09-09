@@ -43,6 +43,9 @@ async function adminSignup(payload: { name?: string; email: string; password: st
     url: "/api/auth/admin/signup",
     payload: { name: payload.name ?? "Admin", ...payload },
   });
+  if (res.statusCode >= 400) {
+    throw new Error(`adminSignup failed (${res.statusCode}): ${res.payload}`);
+  }
   return JSON.parse(res.payload) as { token: string; user: { id: string }; shop: { id: string; name: string; location: string } };
 }
 
