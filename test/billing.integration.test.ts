@@ -13,27 +13,12 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { prisma } from "../src/lib/prisma.js";
 import { checkoutBill } from "../src/services/billingService.js";
 import { collectPayment } from "../src/services/creditService.js";
+import { resetDb } from "./dbReset.js";
 
 let shopId: string;
 let cashierId: string;
 let productId: string;
 let customerId: string;
-
-async function resetDb() {
-  await prisma.auditLog.deleteMany();
-  await prisma.creditTransaction.deleteMany();
-  await prisma.payment.deleteMany();
-  await prisma.billItem.deleteMany();
-  await prisma.bill.deleteMany();
-  await prisma.billCounter.deleteMany();
-  await prisma.cashierSession.deleteMany();
-  await prisma.inventoryMovement.deleteMany();
-  await prisma.product.deleteMany();
-  await prisma.customer.deleteMany();
-  await prisma.session.deleteMany();
-  await prisma.user.deleteMany();
-  await prisma.shop.deleteMany();
-}
 
 beforeAll(async () => {
   await prisma.$connect();

@@ -14,17 +14,9 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
 import { buildApp } from "../src/app.js";
 import { prisma } from "../src/lib/prisma.js";
+import { resetDb } from "./dbReset.js";
 
 let app: FastifyInstance;
-
-async function resetDb() {
-  await prisma.auditLog.deleteMany();
-  await prisma.session.deleteMany();
-  await prisma.adminShopLink.deleteMany();
-  await prisma.invitationCode.deleteMany();
-  await prisma.user.deleteMany();
-  await prisma.shop.deleteMany();
-}
 
 beforeAll(async () => {
   app = await buildApp();

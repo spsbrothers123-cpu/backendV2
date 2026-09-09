@@ -18,20 +18,13 @@ import type { FastifyInstance } from "fastify";
 import { buildApp } from "../src/app.js";
 import { prisma } from "../src/lib/prisma.js";
 import { hashPassword } from "../src/lib/password.js";
+import { resetDb } from "./dbReset.js";
 
 let app: FastifyInstance;
 let shopId: string;
 let adminEmail: string;
 let adminId: string;
 let adminToken: string;
-
-async function resetDb() {
-  await prisma.auditLog.deleteMany();
-  await prisma.session.deleteMany();
-  await prisma.invitationCode.deleteMany();
-  await prisma.user.deleteMany();
-  await prisma.shop.deleteMany();
-}
 
 beforeAll(async () => {
   app = await buildApp();

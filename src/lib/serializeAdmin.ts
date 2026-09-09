@@ -153,7 +153,7 @@ export function toActiveSession(
 }
 
 export function toSessionHistoryItem(
-  s: CashierSession & { cashier: User },
+  s: CashierSession & { cashier: User; shop: { name: string } },
   summary: { sales: number; cashSales: number }
 ): Record<string, unknown> {
   const expected = toNumber(s.openingCash) + summary.cashSales;
@@ -161,6 +161,10 @@ export function toSessionHistoryItem(
   return {
     id: s.id,
     cashier: s.cashier.name,
+    // Sessions spans every shop the admin owns (Phase 3 spec §2) — the Shop
+    // column lets the Admin tell apart same-named cashiers at different
+    // shops without this needing to double as the row's authorization scope.
+    shop: s.shop.name,
     openingTime: s.openedAt.toISOString(),
     closingTime: s.closedAt ? s.closedAt.toISOString() : "",
     openingCash: toNumber(s.openingCash),
