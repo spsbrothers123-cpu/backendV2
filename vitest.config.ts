@@ -29,7 +29,14 @@ export default defineConfig({
     // with the next test's resetDb() and throw spurious FK violations.
     // Generous timeouts here aren't just about patience; they prevent
     // that class of false failure entirely.
-    testTimeout: 30000,
-    hookTimeout: 30000,
+    // Phase 3's fixtures (twoShopAdminWithCashiers: 3 sequential admin
+    // signups + cashier creates + shop switches, each several real
+    // round-trips to Supabase) run noticeably more queries per test than
+    // earlier phases did. 30s was tuned for those earlier phases and is
+    // now routinely too tight for the heavier Phase 3 tests specifically —
+    // bumping the ceiling rather than the query count, since the latency
+    // here is network RTT to a remote DB, not anything CPU-bound.
+    testTimeout: 90000,
+    hookTimeout: 90000,
   },
 });

@@ -47,6 +47,6 @@ export function toPublicCashier(user: User & { shop: Shop | null }): PublicCashi
     branchName: user.branchName ?? undefined,
     role: toPublicRole(user.role),
     active: user.status === "ACTIVE",
-    shop: user.shop ? { id: user.shop.id, name: user.shop.name, location: user.shop.address ?? undefined } : null,
+    shop: user.shop ? { id: user.shop.id, name: user.shop.name, location: user.shop.location ?? undefined } : null,
   };
 }

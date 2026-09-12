@@ -77,16 +77,29 @@ async function cashierLogin(email: string, password = "Password123") {
  * shops.
  */
 async function twoShopAdminWithCashiers() {
-  const first = await adminSignup({ email: "owner@rbr.test", password: "Password123", shopLocation: "Veerapandi" });
+  // The two shop signups for the SAME admin email must stay sequential —
+  // the second call depends on the first admin already existing. But the
+  // third admin (a wholly separate account) has no such dependency, so it
+  // can run concurrently with the first two instead of adding its own
+  // round-trip on top. Every request here is a real network hop to a
+  // remote Postgres instance, so collapsing independent work into
+  // Promise.all noticeably cuts this fixture's wall-clock cost.
+  const [{ first, second }, other] = await Promise.all([
+    (async () => {
+      const first = await adminSignup({ email: "owner@rbr.test", password: "Password123", shopLocation: "Veerapandi" });
+      const second = await adminSignup({ email: "owner@rbr.test", password: "Password123", shopLocation: "Gandhipuram" });
+      return { first, second };
+    })(),
+    adminSignup({ email: "other-owner@rbr.test", password: "Password123", shopLocation: "Singanallur" }),
+  ]);
   const veerapandi = first.shop;
-  const second = await adminSignup({ email: "owner@rbr.test", password: "Password123", shopLocation: "Gandhipuram" });
   const { token, shop: gandhipuram } = second;
 
-  const arun = await createCashier(veerapandi.id, "Arun", "arun@rbr.test");
-  const bala = await createCashier(gandhipuram.id, "Bala", "bala@rbr.test");
-
-  const other = await adminSignup({ email: "other-owner@rbr.test", password: "Password123", shopLocation: "Singanallur" });
-  const karthik = await createCashier(other.shop.id, "Karthik", "karthik@rbr.test");
+  const [arun, bala, karthik] = await Promise.all([
+    createCashier(veerapandi.id, "Arun", "arun@rbr.test"),
+    createCashier(gandhipuram.id, "Bala", "bala@rbr.test"),
+    createCashier(other.shop.id, "Karthik", "karthik@rbr.test"),
+  ]);
 
   return { token, veerapandi, gandhipuram, arun, bala, otherToken: other.token, singanallur: other.shop, karthik };
 }
@@ -349,7 +362,7 @@ describe("Cashier shop isolation (spec §3–6): shopId is always server-derived
       cashierId: arunSession.cashierId,
       customerId: null,
       items: [{ productId: veerapandiProduct.id, quantity: 1 }],
-      payments: [{ method: "CASH", amount: 100 }],
+      payments: [{ method: "cash", amount: 100 }],
       idempotencyKey: null,
     });
     const savedBill = await prisma.bill.findUnique({ where: { id: bill.id } });
@@ -363,7 +376,7 @@ describe("Cashier shop isolation (spec §3–6): shopId is always server-derived
         cashierId: arunSession.cashierId,
         customerId: null,
         items: [{ productId: gandhipuramProduct.id, quantity: 1 }],
-        payments: [{ method: "CASH", amount: 60 }],
+        payments: [{ method: "cash", amount: 60 }],
         idempotencyKey: null,
       })
     ).rejects.toMatchObject({ code: "PRODUCT_NOT_FOUND" });

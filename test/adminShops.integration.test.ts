@@ -38,17 +38,16 @@ async function adminSignup(payload: {
   password: string;
   shopLocation: string;
 }) {
-+  const res = await app.inject({
-     method: "POST",
-     url: "/api/auth/admin/signup",
-     payload: { name: payload.name ?? "Admin", ...payload },
-   });
-+  if (res.statusCode >= 400) {
-+    throw new Error(`adminSignup failed (${res.statusCode}): ${res.payload}`);
-+  }
-+  return res;
- }
-
+  const res = await app.inject({
+    method: "POST",
+    url: "/api/auth/admin/signup",
+    payload: { name: payload.name ?? "Admin", ...payload },
+  });
+  if (res.statusCode >= 400) {
+    throw new Error(`adminSignup failed (${res.statusCode}): ${res.payload}`);
+  }
+  return res;
+}
 
 describe("Admin signup — multi-shop foundation", () => {
   it("creates a new admin and a new shop named 'RBR Egg Mart - <Location>'", async () => {
@@ -121,10 +120,18 @@ describe("Admin signup — multi-shop foundation", () => {
   it("rejects adding a shop to an existing admin email with the wrong password", async () => {
     await adminSignup({ email: "owner@rbr.test", password: "Password123", shopLocation: "Veerapandi" });
 
-    const res = await adminSignup({
-      email: "owner@rbr.test",
-      password: "WrongPassword1",
-      shopLocation: "Gandhipuram",
+    // Deliberately NOT using the adminSignup() helper here — it throws on
+    // any statusCode >= 400, but this call is expected to fail (401), so
+    // we need the raw response to assert against.
+    const res = await app.inject({
+      method: "POST",
+      url: "/api/auth/admin/signup",
+      payload: {
+        name: "Admin",
+        email: "owner@rbr.test",
+        password: "WrongPassword1",
+        shopLocation: "Gandhipuram",
+      },
     });
     expect(res.statusCode).toBe(401);
     expect(JSON.parse(res.payload).code).toBe("INVALID_CREDENTIALS");
@@ -151,10 +158,17 @@ describe("Admin signup — multi-shop foundation", () => {
       },
     });
 
-    const res = await adminSignup({
-      email: "cashier@rbr.test",
-      password: "Password123",
-      shopLocation: "Singanallur",
+    // Same deal — this call is expected to fail (409), so it can't go
+    // through the throwing adminSignup() helper.
+    const res = await app.inject({
+      method: "POST",
+      url: "/api/auth/admin/signup",
+      payload: {
+        name: "Admin",
+        email: "cashier@rbr.test",
+        password: "Password123",
+        shopLocation: "Singanallur",
+      },
     });
     expect(res.statusCode).toBe(409);
     expect(JSON.parse(res.payload).code).toBe("ACCOUNT_ALREADY_EXISTS");

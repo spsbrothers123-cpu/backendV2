@@ -133,9 +133,10 @@ export async function checkoutBill(input: CheckoutInput) {
   const grandTotal = round2(subtotal.minus(discount).plus(tax));
 
   // ── Validate payments against the BACKEND-computed total. ────────────
-  const validMethods = new Set(["cash", "card", "upi", "credit"]);
+    const validMethods = new Set(["cash", "card", "upi", "credit"]);
   let paymentSum = ZERO;
   for (const p of input.payments) {
+    p.method = p.method.toLowerCase();
     if (!validMethods.has(p.method)) {
       throw Errors.validation(`Unsupported payment method: ${p.method}`);
     }
@@ -226,7 +227,7 @@ export async function checkoutBill(input: CheckoutInput) {
       }
 
       return created;
-    });
+    },{ timeout: 15_000, maxWait: 10_000 });
 
     await recordAudit({
       action: "BILL_CREATED",
