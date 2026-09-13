@@ -5,6 +5,7 @@ import { Errors } from "../../lib/errors.js";
 import { parseBody } from "../../lib/validate.js";
 import { recordAudit } from "../../lib/audit.js";
 import { sendCashierApproved, sendCashierRejected } from "../../lib/email.js";
+import { listShopsForAdmin } from "../../lib/shopAccess.js";
 import type { AccountStatus } from "@prisma/client";
 
 const listQuerySchema = z.object({
@@ -56,20 +57,24 @@ export default async function cashierRequestsRoutes(fastify: FastifyInstance) {
   fastify.get("/", async (request) => {
     const query = parseBody(listQuerySchema, request.query);
     const admin = request.authUser!;
+    const shopIds = (await listShopsForAdmin(admin.id)).map((s) => s.id);
 
     const statusFilter: AccountStatus[] =
       query.status && query.status !== "ALL" ? [query.status] : ["PENDING_ADMIN_APPROVAL", "REJECTED"];
 
-    const users = await prisma.user.findMany({
-      where: {
-        role: "CASHIER",
-        status: { in: statusFilter },
-        // Admin never sees or approves another shop's requests.
-        shopId: admin.shopId ?? undefined,
-      },
-      include: { shop: { select: { id: true, name: true } } },
-      orderBy: { createdAt: "desc" },
-    });
+    const users = shopIds.length
+      ? await prisma.user.findMany({
+          where: {
+            role: "CASHIER",
+            status: { in: statusFilter },
+            // Admin sees requests across every shop they own, not just the
+            // currently-selected one — same scope as cashiers.ts/sessions.ts.
+            shopId: { in: shopIds },
+          },
+          include: { shop: { select: { id: true, name: true } } },
+          orderBy: { createdAt: "desc" },
+        })
+      : [];
 
     return { success: true, data: users.map(toSafeRequest), message: "Success" };
   });
@@ -77,11 +82,12 @@ export default async function cashierRequestsRoutes(fastify: FastifyInstance) {
   // ── GET /api/admin/cashier-requests/:id ──────────────────────────────
   fastify.get<{ Params: { id: string } }>("/:id", async (request) => {
     const admin = request.authUser!;
+    const shopIds = (await listShopsForAdmin(admin.id)).map((s) => s.id);
     const user = await prisma.user.findUnique({
       where: { id: request.params.id },
       include: { shop: { select: { id: true, name: true } } },
     });
-    if (!user || user.role !== "CASHIER" || user.shopId !== admin.shopId) {
+    if (!user || user.role !== "CASHIER" || !user.shopId || !shopIds.includes(user.shopId)) {
       throw Errors.notFound("Cashier request not found.", "REQUEST_NOT_FOUND");
     }
     return { success: true, data: toSafeRequest(user), message: "Success" };
@@ -95,9 +101,10 @@ export default async function cashierRequestsRoutes(fastify: FastifyInstance) {
   // admin approval is still required").
   fastify.post<{ Params: { id: string } }>("/:id/approve", async (request) => {
     const admin = request.authUser!;
+    const shopIds = (await listShopsForAdmin(admin.id)).map((s) => s.id);
     const target = await prisma.user.findUnique({ where: { id: request.params.id } });
 
-    if (!target || target.role !== "CASHIER" || target.shopId !== admin.shopId) {
+    if (!target || target.role !== "CASHIER" || !target.shopId || !shopIds.includes(target.shopId)) {
       throw Errors.notFound("Cashier request not found.", "REQUEST_NOT_FOUND");
     }
     if (target.status !== "PENDING_ADMIN_APPROVAL") {
@@ -113,7 +120,9 @@ export default async function cashierRequestsRoutes(fastify: FastifyInstance) {
       action: "CASHIER_APPROVED",
       actorId: admin.id,
       actorRole: "ADMIN",
-      shopId: admin.shopId,
+      // The cashier's OWN shop, not admin.shopId — this admin may be
+      // approving a request for a shop they don't currently have selected.
+      shopId: target.shopId,
       entityType: "User",
       entityId: target.id,
     });
@@ -127,9 +136,10 @@ export default async function cashierRequestsRoutes(fastify: FastifyInstance) {
   fastify.post<{ Params: { id: string } }>("/:id/reject", async (request) => {
     const admin = request.authUser!;
     const body = parseBody(rejectBodySchema, request.body ?? {});
+    const shopIds = (await listShopsForAdmin(admin.id)).map((s) => s.id);
 
     const target = await prisma.user.findUnique({ where: { id: request.params.id } });
-    if (!target || target.role !== "CASHIER" || target.shopId !== admin.shopId) {
+    if (!target || target.role !== "CASHIER" || !target.shopId || !shopIds.includes(target.shopId)) {
       throw Errors.notFound("Cashier request not found.", "REQUEST_NOT_FOUND");
     }
     if (target.status !== "PENDING_ADMIN_APPROVAL") {
@@ -150,7 +160,8 @@ export default async function cashierRequestsRoutes(fastify: FastifyInstance) {
       action: "CASHIER_REJECTED",
       actorId: admin.id,
       actorRole: "ADMIN",
-      shopId: admin.shopId,
+      // The cashier's OWN shop, not admin.shopId — same reasoning as approve.
+      shopId: target.shopId,
       entityType: "User",
       entityId: target.id,
       metadata: body.reason ? { reason: body.reason } : undefined,
