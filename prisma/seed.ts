@@ -43,6 +43,25 @@ async function main() {
     create: { adminId: admin.id, shopId: shop.id },
   });
 
+  // Cashier-level inventory foundation: seed one demo cashier so the
+  // seeded products' stock has an owner — every unit of stock belongs to
+  // a specific cashier, never a shop-wide pool (see CashierInventory in
+  // schema.prisma).
+  const cashierEmail = process.env.SEED_CASHIER_EMAIL || "cashier@eggmart.test";
+  const cashierPasswordHash = await bcrypt.hash(process.env.SEED_CASHIER_PASSWORD || "Cashier@12345", 12);
+  const cashier = await prisma.user.upsert({
+    where: { email: cashierEmail },
+    update: {},
+    create: {
+      name: process.env.SEED_CASHIER_NAME || "Demo Cashier",
+      email: cashierEmail,
+      passwordHash: cashierPasswordHash,
+      role: "CASHIER",
+      status: "ACTIVE",
+      shopId: shop.id,
+    },
+  });
+
   // ── Phase 2 demo data — a handful of products and customers so both
   // frontends have something real to show immediately after seeding. ──
   //
@@ -871,10 +890,19 @@ async function main() {
   ];
 
   for (const p of products) {
-    await prisma.product.upsert({
+    const created = await prisma.product.upsert({
       where: { shopId_barcode: { shopId: shop.id, barcode: p.barcode } },
       update: {},
       create: { shopId: shop.id, ...p },
+    });
+    // Assign the seeded stock to the seeded cashier — keeps
+    // CashierInventory in sync with Product.stock (its denormalized sum)
+    // from the start, exactly like the Phase 1 migration's backfill does
+    // for a real shop's pre-existing data.
+    await prisma.cashierInventory.upsert({
+      where: { shopId_cashierId_productId: { shopId: shop.id, cashierId: cashier.id, productId: created.id } },
+      update: {},
+      create: { shopId: shop.id, cashierId: cashier.id, productId: created.id, quantity: p.stock },
     });
   }
 
@@ -897,7 +925,7 @@ async function main() {
 
   // eslint-disable-next-line no-console
   console.log(
-    `Seeded shop "${shop.name}" (${shop.code}) and admin ${adminEmail}.`,
+    `Seeded shop "${shop.name}" (${shop.code}), admin ${adminEmail}, and cashier ${cashierEmail}.`,
   );
   // eslint-disable-next-line no-console
   console.log(

@@ -62,8 +62,11 @@ const adminSignupSchema = z.object({
 // would otherwise starve the test suite itself. Production behavior is
 // untouched: `rateLimit: false` is @fastify/rate-limit's documented
 // per-route opt-out, applied only when NODE_ENV === "test".
-const authRateLimit = (max: number, timeWindow: string) =>
-  env.NODE_ENV === "test" ? { rateLimit: false as const } : { rateLimit: { max, timeWindow } };
+const authRateLimit = (
+  max: number,
+  timeWindow: string
+): { rateLimit: false | { max: number; timeWindow: string } } =>
+  env.NODE_ENV === "test" ? { rateLimit: false } : { rateLimit: { max, timeWindow } };
 
 export default async function authRoutes(fastify: FastifyInstance) {
   // ── POST /api/auth/signup/verify-invitation — cashier signup, step 1 ──

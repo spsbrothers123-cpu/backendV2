@@ -7,6 +7,7 @@ import { recordAudit } from "../../lib/audit.js";
 import { toAdminProduct, toStockMovement, paginate, productStatusLabel } from "../../lib/serializeAdmin.js";
 import { toNumber } from "../../lib/money.js";
 import { adjustStock } from "../../services/inventoryService.js";
+import { assertCashierBelongsToShop } from "../../lib/cashierAccess.js";
 
 const overviewQuerySchema = z.object({
   search: z.string().optional(),
@@ -25,6 +26,9 @@ const movementsQuerySchema = z.object({
 
 const adjustmentSchema = z.object({
   productId: z.string(),
+  // Cashier-level inventory foundation: every manual adjustment targets a
+  // specific cashier's own inventory — never a shop-wide pool.
+  cashierId: z.string().trim().min(1, "Select which cashier this adjustment applies to."),
   adjustmentType: z.enum(["add", "remove"]),
   quantity: z.coerce.number().positive(),
   reason: z.string().trim().min(1),
@@ -113,12 +117,15 @@ export default async function adminInventoryRoutes(fastify: FastifyInstance) {
     if (!product || product.shopId !== admin.shopId) {
       throw Errors.notFound("Product not found.", "PRODUCT_NOT_FOUND");
     }
+    // Never trust the admin-selected cashierId at face value.
+    await assertCashierBelongsToShop(admin.shopId!, body.cashierId);
 
     const delta = body.adjustmentType === "add" ? body.quantity : -body.quantity;
 
     const updated = await prisma.$transaction(async (tx) => {
       await adjustStock(tx, {
         shopId: admin.shopId!,
+        cashierId: body.cashierId,
         productId: product.id,
         delta,
         type: "ADJUSTMENT",
@@ -135,10 +142,47 @@ export default async function adminInventoryRoutes(fastify: FastifyInstance) {
       shopId: admin.shopId,
       entityType: "Product",
       entityId: product.id,
-      metadata: { delta, reason: body.reason },
+      metadata: { delta, reason: body.reason, cashierId: body.cashierId },
     });
 
     return toAdminProduct(updated);
+  });
+
+  // ── GET /api/admin/inventory/:productId/by-cashier ────────────────────
+  // Per-cashier breakdown for one product — e.g. "Arun: 50, Bala: 100".
+  // Never merges these into a single number; each row is that cashier's
+  // own, isolated stock. Also what an Admin UI would use to populate the
+  // "which cashier?" selector for /adjustments and purchases.
+  fastify.get<{ Params: { productId: string } }>("/:productId/by-cashier", async (request) => {
+    const admin = request.authUser!;
+    const product = await prisma.product.findUnique({ where: { id: request.params.productId } });
+    if (!product || product.shopId !== admin.shopId) {
+      throw Errors.notFound("Product not found.", "PRODUCT_NOT_FOUND");
+    }
+
+    const [rows, cashiers] = await Promise.all([
+      prisma.cashierInventory.findMany({
+        where: { shopId: admin.shopId!, productId: product.id },
+        include: { cashier: { select: { id: true, name: true } } },
+      }),
+      prisma.user.findMany({
+        where: { shopId: admin.shopId!, role: "CASHIER", status: "ACTIVE" },
+        select: { id: true, name: true },
+        orderBy: { name: "asc" },
+      }),
+    ]);
+
+    const quantityByCashierId = new Map(rows.map((r) => [r.cashierId, r.quantity]));
+    return {
+      productId: product.id,
+      productName: product.name,
+      totalStock: product.stock,
+      byCashier: cashiers.map((c) => ({
+        cashierId: c.id,
+        cashierName: c.name,
+        quantity: quantityByCashierId.get(c.id) ?? 0,
+      })),
+    };
   });
 
   // ── GET /api/admin/inventory/alerts ───────────────────────────────────

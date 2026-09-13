@@ -1,6 +1,7 @@
 import type { FastifyInstance } from "fastify";
 import { prisma } from "../lib/prisma.js";
 import { toCashierProduct } from "../lib/serializeCashier.js";
+import { getCashierStockMap } from "../services/inventoryService.js";
 
 export default async function productsRoutes(fastify: FastifyInstance) {
   fastify.addHook("preHandler", fastify.requireRole("CASHIER"));
@@ -8,13 +9,18 @@ export default async function productsRoutes(fastify: FastifyInstance) {
   // ── GET /api/products?query=&category=&barcode= ──────────────────────
   fastify.get<{ Querystring: { query?: string; category?: string; barcode?: string } }>("/", async (request) => {
     const shopId = request.authUser!.shopId!;
+    // Cashier-level inventory foundation: stock shown here is always THIS
+    // authenticated cashier's own — never the shop-wide Product.stock
+    // aggregate. cashierId comes from the JWT, never the request.
+    const cashierId = request.authUser!.id;
     const { query, category, barcode } = request.query;
 
     if (barcode) {
       const products = await prisma.product.findMany({
         where: { shopId, status: "ACTIVE", barcode },
       });
-      return products.map(toCashierProduct);
+      const stockMap = await getCashierStockMap(prisma, shopId, cashierId, products.map((p) => p.id));
+      return products.map((p) => toCashierProduct(p, stockMap.get(p.id) ?? 0));
     }
 
     const products = await prisma.product.findMany({
@@ -34,7 +40,8 @@ export default async function productsRoutes(fastify: FastifyInstance) {
       },
       orderBy: { name: "asc" },
     });
-    return products.map(toCashierProduct);
+    const stockMap = await getCashierStockMap(prisma, shopId, cashierId, products.map((p) => p.id));
+    return products.map((p) => toCashierProduct(p, stockMap.get(p.id) ?? 0));
   });
 
   // ── GET /api/products/categories ──────────────────────────────────────

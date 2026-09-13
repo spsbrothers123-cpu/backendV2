@@ -30,7 +30,19 @@ export const UNIT_MAP_REVERSE: Record<string, string> = Object.fromEntries(
 const METHOD_MAP: Record<string, string> = { CASH: "cash", CARD: "card", UPI: "upi", CREDIT: "credit" };
 export const METHOD_MAP_REVERSE: Record<string, string> = { cash: "CASH", card: "CARD", upi: "UPI", credit: "CREDIT" };
 
-export function toCashierProduct(p: Product): Record<string, unknown> {
+/**
+ * `cashierStock`, when provided, overrides `stock` with the AUTHENTICATED
+ * cashier's own CashierInventory quantity for this product — required for
+ * any live "what can I sell right now" view (POS browse/search), per the
+ * cashier-level inventory isolation requirement: a cashier must only ever
+ * see their own stock, never the shop-wide total (p.stock).
+ *
+ * Omitted (falls back to p.stock) only for historical/snapshot contexts —
+ * receipts, held-bill line items, bill history — where the number is
+ * informational display of a past line item, not a live "can I sell this"
+ * check, so the shop-wide aggregate is an acceptable snapshot value.
+ */
+export function toCashierProduct(p: Product, cashierStock?: number): Record<string, unknown> {
   return {
     id: p.id,
     name: p.name,
@@ -39,7 +51,7 @@ export function toCashierProduct(p: Product): Record<string, unknown> {
     category: p.category,
     price: toNumber(p.sellingPrice),
     unit: UNIT_MAP[p.unit] ?? p.unit.toLowerCase(),
-    stock: p.stock,
+    stock: cashierStock ?? p.stock,
   };
 }
 

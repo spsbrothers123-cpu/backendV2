@@ -6,6 +6,7 @@ import { recordAudit } from "../../lib/audit.js";
 import { toAdminPurchase, paginate, UNIT_MAP, UNIT_MAP_REVERSE } from "../../lib/serializeAdmin.js";
 import { toDecimal, add, mul, round2, ZERO, toNumber } from "../../lib/money.js";
 import { adjustStock } from "../../services/inventoryService.js";
+import { assertCashierBelongsToShop } from "../../lib/cashierAccess.js";
 import { Errors } from "../../lib/errors.js";
 import {
   buildCsvBuffer,
@@ -40,6 +41,12 @@ const purchaseSchema = z.object({
   supplierName: z.string().trim().min(1),
   invoiceNumber: z.string().trim().min(1),
   purchaseDate: z.string().min(1),
+  // Cashier-level inventory foundation: every catalog item in this
+  // purchase increases THIS cashier's own inventory, never a shop-wide
+  // pool. Required even if every line is a purchase-only item (Option 2,
+  // never touches stock) — simpler and more predictable than making it
+  // conditionally required, and harmless when unused.
+  cashierId: z.string().trim().min(1, "Select which cashier receives this stock."),
   items: z
     .array(
       z.object({
@@ -144,6 +151,10 @@ export default async function adminPurchasesRoutes(fastify: FastifyInstance) {
     const admin = request.authUser!;
     const body = parseBody(purchaseSchema, request.body);
 
+    // Never trust the admin-selected cashierId at face value — confirm it
+    // actually belongs to this admin's shop before any stock moves.
+    await assertCashierBelongsToShop(admin.shopId!, body.cashierId);
+
     // Split once: catalog items (real productId, must resolve against this
     // shop's Product Catalog and move stock) vs purchase-only items (no
     // productId — never touch Product or inventory). Every item still
@@ -201,6 +212,7 @@ export default async function adminPurchasesRoutes(fastify: FastifyInstance) {
       for (const item of catalogItems) {
         await adjustStock(tx, {
           shopId: admin.shopId!,
+          cashierId: body.cashierId,
           productId: item.productId!,
           delta: item.quantity,
           type: "IN",
@@ -219,7 +231,7 @@ export default async function adminPurchasesRoutes(fastify: FastifyInstance) {
       shopId: admin.shopId,
       entityType: "Purchase",
       entityId: purchase.id,
-      metadata: { invoiceNumber: purchase.invoiceNumber, purchaseOnlyItemCount: purchaseOnlyItems.length },
+      metadata: { invoiceNumber: purchase.invoiceNumber, purchaseOnlyItemCount: purchaseOnlyItems.length, cashierId: body.cashierId },
     });
 
     return reply.code(201).send(toAdminPurchase(purchase));

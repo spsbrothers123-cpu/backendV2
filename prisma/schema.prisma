@@ -164,6 +164,7 @@ model Shop {
   bills            Bill[]
   creditTxns       CreditTransaction[]
   inventoryMoves   InventoryMovement[]
+  cashierInventories CashierInventory[]
   purchases        Purchase[]
   expenses         Expense[]
   billCounters     BillCounter[]
@@ -344,6 +345,8 @@ model User {
   cashierSessions     CashierSession[]
   billsAsCashier      Bill[]              @relation("CashierBills")
   inventoryMoves      InventoryMovement[]
+  inventoryMovesAsCashierOwner InventoryMovement[] @relation("InventoryMovementCashier")
+  cashierInventories  CashierInventory[]  @relation("CashierInventoryOwner")
   purchasesCreated    Purchase[]
   expensesCreated     Expense[]
   creditTxnsActed     CreditTransaction[]
@@ -414,6 +417,11 @@ model Product {
   sellingPrice      Decimal       @db.Decimal(12, 2)
   costPrice         Decimal?      @db.Decimal(12, 2)
 
+  // Cashier-level inventory foundation: this is now a denormalized SUM of
+  // every CashierInventory row for this product, not an independent,
+  // directly-editable number — see CashierInventory's doc comment. Only
+  // adjustStock() writes it, always alongside the matching
+  // CashierInventory change, in the same transaction.
   stock             Int           @default(0)
   unit              ProductUnit
   lowStockThreshold Int           @default(0)
@@ -424,12 +432,51 @@ model Product {
 
   billItems         BillItem[]
   inventoryMoves    InventoryMovement[]
+  cashierInventories CashierInventory[]
   purchaseItems     PurchaseItem[]
 
   @@index([shopId, status])
   @@index([shopId, category])
   @@unique([shopId, barcode])
   @@map("products")
+}
+
+// ── Cashier-level inventory foundation (RBR Egg Mart Phase 1 addition) ──
+//
+// The source of truth for "how much of this product does THIS cashier
+// have". Every unit of stock is owned by exactly one (shop, cashier,
+// product) tuple — cashiers never share a pooled shop-wide stock, even
+// when they work the same shop. See src/services/inventoryService.ts
+// (adjustStock) for the single chokepoint that reads/writes this table.
+//
+// Product.stock is kept as a denormalized SUM of every CashierInventory
+// row for that product (updated by the same delta in the same
+// transaction — see adjustStock). It still answers shop-wide questions
+// (Admin KPIs, low-stock alerts, the product catalog list) without
+// re-aggregating on every read, but it is NEVER the number shown to a
+// cashier for their own POS — that always comes from this table, scoped
+// to shopId + cashierId, per the isolation requirement.
+model CashierInventory {
+  id        String   @id @default(uuid())
+  shopId    String
+  shop      Shop     @relation(fields: [shopId], references: [id])
+  cashierId String
+  cashier   User     @relation("CashierInventoryOwner", fields: [cashierId], references: [id])
+  productId String
+  product   Product  @relation(fields: [productId], references: [id])
+
+  quantity  Int      @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // The (shopId, cashierId, productId) triple is the isolation boundary:
+  // one row per cashier per product, never merged across cashiers or
+  // shops (see the migration's data-preservation notes).
+  @@unique([shopId, cashierId, productId])
+  @@index([shopId, cashierId])
+  @@index([productId])
+  @@map("cashier_inventories")
 }
 
 model Customer {
@@ -606,6 +653,14 @@ model InventoryMovement {
   productId     String
   product       Product           @relation(fields: [productId], references: [id])
 
+  // Cashier-level inventory foundation: whose CashierInventory row this
+  // movement changed. previousStock/newStock below are that cashier's
+  // quantity, not a shop-wide total. Nullable only because rows written
+  // before this column existed have no cashier on file; every new
+  // movement always sets it (adjustStock requires a cashierId).
+  cashierId     String?
+  cashier       User?             @relation("InventoryMovementCashier", fields: [cashierId], references: [id])
+
   type          StockMovementType
   // Signed delta: positive for IN/increase, negative for OUT/decrease.
   quantity      Int
@@ -613,6 +668,9 @@ model InventoryMovement {
   newStock      Int
   reason        String
 
+  // Who performed the action (a cashier selling, or an admin recording a
+  // purchase/adjustment on a cashier's behalf) — distinct from cashierId
+  // above when an admin acts on a cashier's inventory.
   actorId       String?
   actor         User?             @relation(fields: [actorId], references: [id])
 
@@ -620,6 +678,7 @@ model InventoryMovement {
 
   @@index([shopId, createdAt])
   @@index([productId])
+  @@index([cashierId])
   @@map("inventory_movements")
 }
 

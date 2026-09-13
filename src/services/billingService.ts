@@ -164,6 +164,10 @@ export async function checkoutBill(input: CheckoutInput) {
       for (const item of input.items) {
         await adjustStock(tx, {
           shopId: input.shopId,
+          // Sale always decrements the selling cashier's OWN inventory —
+          // input.cashierId is the authenticated cashier from the route
+          // (request.authUser!.id), never a value trusted from the body.
+          cashierId: input.cashierId,
           productId: item.productId,
           delta: -item.quantity,
           type: "OUT",
