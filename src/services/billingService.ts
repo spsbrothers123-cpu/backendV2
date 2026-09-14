@@ -79,6 +79,18 @@ export async function checkoutBill(input: CheckoutInput) {
 
   const session = await findActiveSession(input.shopId, input.cashierId);
 
+  // ── Phase 3: a customer attached to this bill must be this cashier's
+  // own — never another cashier's (or another shop's, if the id happened
+  // to be guessable). Admin-created/unassigned customers (cashierId null)
+  // are still off-limits here too: billing always attaches to a customer
+  // this specific cashier created. ─────────────────────────────────────
+  if (input.customerId) {
+    const customer = await prisma.customer.findUnique({ where: { id: input.customerId } });
+    if (!customer || customer.shopId !== input.shopId || customer.cashierId !== input.cashierId) {
+      throw Errors.notFound("Customer not found.", "CUSTOMER_NOT_FOUND");
+    }
+  }
+
   // ── Resolve products & prices from the DATABASE — never the frontend. ─
   const productIds = [...new Set(input.items.map((i) => i.productId))];
   const products = await prisma.product.findMany({ where: { id: { in: productIds }, shopId: input.shopId } });

@@ -4,7 +4,6 @@ import { prisma } from "../lib/prisma.js";
 import { toNumber } from "../lib/money.js";
 
 const querySchema = z.object({
-  cashierId: z.string().optional(),
   from: z.string().optional(),
   to: z.string().optional(),
 });
@@ -21,7 +20,12 @@ export default async function reportsRoutes(fastify: FastifyInstance) {
       where: {
         shopId: cashier.shopId!,
         status: "PAID",
-        cashierId: q.cashierId ?? cashier.id,
+        // Phase 3 / security fix: this used to accept a client-supplied
+        // cashierId (q.cashierId ?? cashier.id), letting any cashier pull
+        // another cashier's sales report just by adding ?cashierId=... to
+        // the request. Always the caller's own id now — never trusted
+        // from the query string.
+        cashierId: cashier.id,
         ...(q.from || q.to
           ? { createdAt: { ...(q.from ? { gte: new Date(q.from) } : {}), ...(q.to ? { lte: new Date(q.to) } : {}) } }
           : {}),

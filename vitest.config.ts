@@ -12,6 +12,10 @@ export default defineConfig({
           "test/auth.integration.test.ts",
           "test/billing.integration.test.ts",
           "test/adminShops.integration.test.ts",
+          // Needs a real DB just like the three above — its own docstring
+          // says as much — but was missing from this list, so a plain
+          // `npm test` (no DATABASE_URL/engine available) failed on it.
+          "test/multiShopCashiersSessions.integration.test.ts",
         ],
 
     fileParallelism: false,

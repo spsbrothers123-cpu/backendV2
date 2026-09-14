@@ -10,6 +10,12 @@ export interface CreateCustomerInput {
   phone: string;
   actorId: string;
   actorRole: Role;
+  // Phase 3 cashier data isolation: set when a CASHIER creates this
+  // customer, so it lands in that cashier's own scope (see
+  // routes/customers.ts). Admin-created customers (routes/admin/customers.ts)
+  // never pass this — they stay unassigned/shop-wide, visible to every
+  // cashier's admin oversight but not claimed by any one cashier.
+  cashierId?: string | null;
 }
 
 /**
@@ -17,16 +23,20 @@ export interface CreateCustomerInput {
  * (POST /api/customers) and Admin (POST /api/admin/customers) endpoints.
  * There is exactly one `customers` table — a customer created by a
  * cashier IS the same row an admin sees on the Customers page, scoped to
- * the same shop (see Customer @@unique([shopId, phone]) in schema.prisma).
+ * the same shop. Since Phase 3, it's also scoped to the creating cashier
+ * (see Customer @@unique([shopId, cashierId, phone]) in schema.prisma) —
+ * Admin still sees every customer in the shop regardless of cashierId;
+ * only the Cashier-facing endpoints filter by it.
  *
- * shopId must always come from the authenticated user (request.authUser),
- * never from the request body, so a cashier/admin can never create or
- * collide with another shop's customers.
+ * shopId and cashierId must always come from the authenticated user
+ * (request.authUser), never from the request body, so a cashier/admin can
+ * never create or collide with another shop's — or another cashier's —
+ * customers.
  */
 export async function createCustomerForShop(input: CreateCustomerInput) {
   try {
     const customer = await prisma.customer.create({
-      data: { shopId: input.shopId, name: input.name, phone: input.phone },
+      data: { shopId: input.shopId, name: input.name, phone: input.phone, cashierId: input.cashierId ?? null },
     });
 
     await recordAudit({

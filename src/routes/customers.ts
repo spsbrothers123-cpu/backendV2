@@ -15,12 +15,17 @@ export default async function customersRoutes(fastify: FastifyInstance) {
   fastify.addHook("preHandler", fastify.requireRole("CASHIER"));
 
   // ── GET /api/customers?query= ─────────────────────────────────────────
+  // Phase 3: a cashier only ever sees customers they themselves created —
+  // never another cashier's, even within the same shop. cashierId comes
+  // from the JWT (request.authUser), never the request.
   fastify.get<{ Querystring: { query?: string } }>("/", async (request) => {
     const shopId = request.authUser!.shopId!;
+    const cashierId = request.authUser!.id;
     const { query } = request.query;
     const customers = await prisma.customer.findMany({
       where: {
         shopId,
+        cashierId,
         ...(query
           ? { OR: [{ name: { contains: query, mode: "insensitive" } }, { phone: { contains: query } }] }
           : {}),
@@ -48,6 +53,7 @@ export default async function customersRoutes(fastify: FastifyInstance) {
 
     const customer = await createCustomerForShop({
       shopId: cashier.shopId,
+      cashierId: cashier.id,
       name: body.name,
       phone: body.phone,
       actorId: cashier.id,

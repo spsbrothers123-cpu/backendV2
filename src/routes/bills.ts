@@ -71,9 +71,11 @@ export default async function billsRoutes(fastify: FastifyInstance) {
   // ── GET /api/bills/held ────────────────────────────────────────────
   // NOTE: registered before "/:id"-style routes to avoid path collisions.
   fastify.get("/held", async (request) => {
-    const shopId = request.authUser!.shopId!;
+    const cashier = request.authUser!;
+    // Phase 3: was shop-wide (any cashier could see every held bill in
+    // the shop) — now scoped to the requesting cashier only.
     const bills = await prisma.bill.findMany({
-      where: { shopId, status: "HELD" },
+      where: { shopId: cashier.shopId!, cashierId: cashier.id, status: "HELD" },
       include: BILL_INCLUDE,
       orderBy: { createdAt: "desc" },
     });
@@ -84,6 +86,15 @@ export default async function billsRoutes(fastify: FastifyInstance) {
   fastify.post("/hold", async (request) => {
     const cashier = request.authUser!;
     const body = parseBody(holdSchema, request.body);
+
+    // Phase 3: same customer-ownership check checkoutBill() enforces —
+    // a held bill can only reference a customer this cashier created.
+    if (body.customer?.id) {
+      const customer = await prisma.customer.findUnique({ where: { id: body.customer.id } });
+      if (!customer || customer.shopId !== cashier.shopId || customer.cashierId !== cashier.id) {
+        throw Errors.notFound("Customer not found.", "CUSTOMER_NOT_FOUND");
+      }
+    }
 
     const productIds = body.items.map((i) => i.product.id);
     const products = await prisma.product.findMany({ where: { id: { in: productIds }, shopId: cashier.shopId! } });
@@ -140,7 +151,9 @@ export default async function billsRoutes(fastify: FastifyInstance) {
   fastify.delete<{ Params: { id: string } }>("/held/:id", async (request) => {
     const cashier = request.authUser!;
     const bill = await prisma.bill.findUnique({ where: { id: request.params.id } });
-    if (!bill || bill.shopId !== cashier.shopId || bill.status !== "HELD") {
+    // Phase 3: also check cashierId — was only checking shopId, so any
+    // cashier in the shop could delete another cashier's held bill.
+    if (!bill || bill.shopId !== cashier.shopId || bill.cashierId !== cashier.id || bill.status !== "HELD") {
       throw Errors.notFound("Held bill not found.", "HELD_BILL_NOT_FOUND");
     }
     await prisma.bill.delete({ where: { id: bill.id } });
@@ -210,7 +223,9 @@ export default async function billsRoutes(fastify: FastifyInstance) {
   fastify.get<{ Params: { id: string } }>("/:id", async (request) => {
     const cashier = request.authUser!;
     const bill = await prisma.bill.findUnique({ where: { id: request.params.id }, include: BILL_INCLUDE });
-    if (!bill || bill.shopId !== cashier.shopId) {
+    // Phase 3: also check cashierId — was only checking shopId, so any
+    // cashier in the shop could look up another cashier's bill by id.
+    if (!bill || bill.shopId !== cashier.shopId || bill.cashierId !== cashier.id) {
       throw Errors.notFound("Bill not found.", "BILL_NOT_FOUND");
     }
     return toCashierBill(bill);

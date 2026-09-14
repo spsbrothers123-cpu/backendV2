@@ -9,6 +9,7 @@ datasource db {
   provider = "postgresql"
   url      = env("DATABASE_URL")
   directUrl = env("DIRECT_URL")
+  shadowDatabaseUrl = env("SHADOW_DATABASE_URL")
 }
 
 enum Role {
@@ -347,6 +348,7 @@ model User {
   inventoryMoves      InventoryMovement[]
   inventoryMovesAsCashierOwner InventoryMovement[] @relation("InventoryMovementCashier")
   cashierInventories  CashierInventory[]  @relation("CashierInventoryOwner")
+  customersAsCashier  Customer[]          @relation("CashierCustomers")
   purchasesCreated    Purchase[]
   expensesCreated     Expense[]
   creditTxnsActed     CreditTransaction[]
@@ -484,6 +486,15 @@ model Customer {
   shopId         String
   shop           Shop       @relation(fields: [shopId], references: [id])
 
+  // Phase 3 cashier data isolation: which cashier this customer belongs
+  // to. Null for customers created by an Admin (or created before this
+  // column existed) — those remain shop-wide/unassigned rather than
+  // owned by any one cashier. A cashier-created customer is only ever
+  // visible to that cashier (see routes/customers.ts); Admin's Customers
+  // page still reads the whole shop regardless of this column.
+  cashierId      String?
+  cashier        User?      @relation("CashierCustomers", fields: [cashierId], references: [id])
+
   name           String
   phone          String
 
@@ -501,7 +512,15 @@ model Customer {
   creditTxns     CreditTransaction[]
 
   @@index([shopId])
-  @@unique([shopId, phone])
+  @@index([shopId, cashierId])
+  // Was @@unique([shopId, phone]) pre-Phase-3: one customer per phone per
+  // shop, full stop. Now scoped per cashier so two cashiers in the same
+  // shop can each independently have "a customer with this phone" without
+  // colliding — that's the isolation Phase 3 asks for. Admin-created rows
+  // (cashierId null) still dedup against each other under Postgres' normal
+  // NULL-is-distinct behavior, which mirrors the old shop-wide constraint
+  // for that one case.
+  @@unique([shopId, cashierId, phone])
   @@map("customers")
 }
 
