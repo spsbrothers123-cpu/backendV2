@@ -70,6 +70,7 @@ async function generateInvitationCode() {
     method: "POST",
     url: "/api/admin/invitation-codes",
     headers: { authorization: `Bearer ${adminToken}` },
+    payload: { shopId },
   });
   expect(res.statusCode).toBe(201);
   const body = JSON.parse(res.payload);

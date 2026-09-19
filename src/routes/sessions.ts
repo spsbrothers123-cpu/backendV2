@@ -27,7 +27,11 @@ async function withSummary(session: CashierSession) {
 }
 
 const startSessionSchema = z.object({
-  shopId: z.string().min(1),
+  // Deprecated / ignored: the session's shop is always the authenticated
+  // cashier's own assigned shop. Still accepted (optional) so existing
+  // clients that echo it keep working; if present it must match, otherwise
+  // the request is rejected — it is never used as the source of the value.
+  shopId: z.string().min(1).optional(),
   openingCash: z.number().min(0),
 });
 
@@ -57,7 +61,10 @@ export default async function sessionsRoutes(fastify: FastifyInstance) {
     const cashier = request.authUser!;
     const body = parseBody(startSessionSchema, request.body);
 
-    if (!cashier.shopId || cashier.shopId !== body.shopId) {
+    if (!cashier.shopId) {
+      throw Errors.forbidden("Your account isn't assigned to a shop.", "NO_SHOP");
+    }
+    if (body.shopId !== undefined && body.shopId !== cashier.shopId) {
       throw Errors.forbidden("You can only start a session for your assigned shop.", "SHOP_MISMATCH");
     }
 
@@ -74,7 +81,7 @@ export default async function sessionsRoutes(fastify: FastifyInstance) {
     const session = await prisma.cashierSession.create({
       data: {
         cashierId: cashier.id,
-        shopId: body.shopId,
+        shopId: cashier.shopId,
         openingCash: body.openingCash,
       },
     });

@@ -16,6 +16,7 @@ export default defineConfig({
           // says as much — but was missing from this list, so a plain
           // `npm test` (no DATABASE_URL/engine available) failed on it.
           "test/multiShopCashiersSessions.integration.test.ts",
+          "test/cashierShopAssignment.integration.test.ts",
         ],
 
     fileParallelism: false,
