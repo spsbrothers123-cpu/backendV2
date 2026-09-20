@@ -910,12 +910,18 @@ async function main() {
     { name: "Arjun Kumar", phone: "9800000001" },
     { name: "Priya Sharma", phone: "9800000002" },
   ];
+  // Customer's unique key is now (shopId, cashierId, phone) and cashierId is
+  // nullable, so Prisma can't upsert on it with cashierId = null. Shop-level
+  // demo customers (cashierId null) use find-then-create instead.
   for (const c of customers) {
-    await prisma.customer.upsert({
-      where: { shopId_phone: { shopId: shop.id, phone: c.phone } },
-      update: {},
-      create: { shopId: shop.id, ...c },
+    const existing = await prisma.customer.findFirst({
+      where: { shopId: shop.id, cashierId: null, phone: c.phone },
     });
+    if (!existing) {
+      await prisma.customer.create({
+        data: { shopId: shop.id, cashierId: null, name: c.name, phone: c.phone },
+      });
+    }
   }
 
   // eslint-disable-next-line no-console

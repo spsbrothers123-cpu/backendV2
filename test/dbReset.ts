@@ -47,6 +47,10 @@ export async function resetDb() {
 
     prisma.notification.deleteMany(),
     prisma.expense.deleteMany(),
+
+    // CashierInventory has FKs to product, cashier (User), and shop —
+    // must go before all three of their deleteMany() calls.
+    prisma.cashierInventory.deleteMany(),
     prisma.product.deleteMany(),
     prisma.customer.deleteMany(),
     prisma.shopSettings.deleteMany(),

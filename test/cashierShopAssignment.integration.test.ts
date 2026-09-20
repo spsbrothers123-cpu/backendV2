@@ -63,8 +63,37 @@ function auth(token: string) {
   return { authorization: `Bearer ${token}` };
 }
 
+// The invite-generation endpoint is rate-limited per client IP. app.inject()
+// makes every request come from 127.0.0.1, so across the whole file (~20+
+// invite calls) the limit trips and later tests get a 429 body with no
+// `data` -> "Cannot read properties of undefined (reading 'code')".
+// Giving each call its own fake IP keeps the limiter from ever accumulating.
+let ipCounter = 0;
+function nextIp() {
+  ipCounter += 1;
+  return `10.${(ipCounter >> 8) & 255}.${ipCounter & 255}.1`;
+}
+
 function generateInvite(token: string, payload?: Record<string, unknown>) {
-  return app.inject({ method: "POST", url: "/api/admin/invitation-codes", headers: auth(token), payload });
+  return app.inject({
+    method: "POST",
+    url: "/api/admin/invitation-codes",
+    headers: auth(token),
+    payload,
+    remoteAddress: nextIp(),
+  });
+}
+
+type InviteData = { id: string; code: string; shop: { id: string; name: string } };
+
+/** generateInvite + assert success. Fails with the real status/body instead of
+ * a confusing "undefined.code" TypeError further down. */
+async function inviteFor(token: string, shopId: string): Promise<InviteData> {
+  const res = await generateInvite(token, { shopId });
+  if (res.statusCode !== 201) {
+    throw new Error(`generateInvite(${shopId}) failed: ${res.statusCode} ${res.payload}`);
+  }
+  return JSON.parse(res.payload).data as InviteData;
 }
 
 /** Full cashier lifecycle through the real HTTP API: verify code → signup →
@@ -130,7 +159,8 @@ describe("POST /api/admin/invitation-codes — explicit target shop", () => {
   it("rejects a request with no shopId (no implicit / default shop)", async () => {
     const { token } = await adminWithTwoShops();
     const res = await generateInvite(token);
-    expect(res.statusCode).toBe(400);
+    // Schema-validation failures in this API return 422 (not 400).
+    expect(res.statusCode).toBe(422);
     expect(await prisma.invitationCode.count()).toBe(0);
   });
 
@@ -149,8 +179,8 @@ describe("POST /api/admin/invitation-codes — explicit target shop", () => {
 
   it("keeps one ACTIVE code per shop — generating for B does not revoke A's code", async () => {
     const { token, shopA, shopB } = await adminWithTwoShops();
-    const a = JSON.parse((await generateInvite(token, { shopId: shopA.id })).payload).data;
-    const b = JSON.parse((await generateInvite(token, { shopId: shopB.id })).payload).data;
+    const a = await inviteFor(token, shopA.id);
+    const b = await inviteFor(token, shopB.id);
 
     const rowA = await prisma.invitationCode.findUniqueOrThrow({ where: { id: a.id } });
     const rowB = await prisma.invitationCode.findUniqueOrThrow({ where: { id: b.id } });
@@ -162,8 +192,8 @@ describe("POST /api/admin/invitation-codes — explicit target shop", () => {
 describe("GET /api/admin/invitation-codes/active — per-shop, never stale", () => {
   it("returns only the requested shop's code and labels it with that shop", async () => {
     const { token, shopA, shopB } = await adminWithTwoShops();
-    const a = JSON.parse((await generateInvite(token, { shopId: shopA.id })).payload).data;
-    const b = JSON.parse((await generateInvite(token, { shopId: shopB.id })).payload).data;
+    const a = await inviteFor(token, shopA.id);
+    const b = await inviteFor(token, shopB.id);
 
     const resA = await app.inject({ method: "GET", url: `/api/admin/invitation-codes/active?shopId=${shopA.id}`, headers: auth(token) });
     const resB = await app.inject({ method: "GET", url: `/api/admin/invitation-codes/active?shopId=${shopB.id}`, headers: auth(token) });
@@ -189,7 +219,7 @@ describe("GET /api/admin/invitation-codes/active — per-shop, never stale", () 
 describe("POST /api/admin/invitation-codes/:id/revoke", () => {
   it("revokes a code for an owned shop even when that shop is not the active one", async () => {
     const { token, shopB } = await adminWithTwoShops();
-    const b = JSON.parse((await generateInvite(token, { shopId: shopB.id })).payload).data;
+    const b = await inviteFor(token, shopB.id);
     const res = await app.inject({ method: "POST", url: `/api/admin/invitation-codes/${b.id}/revoke`, headers: auth(token) });
     expect(res.statusCode).toBe(200);
   });
@@ -197,7 +227,7 @@ describe("POST /api/admin/invitation-codes/:id/revoke", () => {
   it("reports another admin's code as not found", async () => {
     const { token } = await adminWithTwoShops();
     const other = await adminSignup("other@rbr.test", "Singanallur");
-    const theirs = JSON.parse((await generateInvite(other.token, { shopId: other.shop.id })).payload).data;
+    const theirs = await inviteFor(other.token, other.shop.id);
     const res = await app.inject({ method: "POST", url: `/api/admin/invitation-codes/${theirs.id}/revoke`, headers: auth(token) });
     expect(res.statusCode).toBe(404);
   });
@@ -208,8 +238,8 @@ describe("POST /api/admin/invitation-codes/:id/revoke", () => {
 describe("Cashier signup assigns the invite's shop", () => {
   it("two cashiers invited to two different shops end up in those two shops", async () => {
     const { token, shopA, shopB } = await adminWithTwoShops();
-    const inviteA = JSON.parse((await generateInvite(token, { shopId: shopA.id })).payload).data;
-    const inviteB = JSON.parse((await generateInvite(token, { shopId: shopB.id })).payload).data;
+    const inviteA = await inviteFor(token, shopA.id);
+    const inviteB = await inviteFor(token, shopB.id);
 
     const c1 = await onboardCashier(token, inviteA.code, "cashier1@eggmart.test");
     const c2 = await onboardCashier(token, inviteB.code, "cashier2@eggmart.test");
@@ -229,7 +259,7 @@ describe("Cashier signup assigns the invite's shop", () => {
 
   it("ignores any shopId / shop info the cashier frontend tries to send at signup", async () => {
     const { token, shopA, shopB } = await adminWithTwoShops();
-    const inviteB = JSON.parse((await generateInvite(token, { shopId: shopB.id })).payload).data;
+    const inviteB = await inviteFor(token, shopB.id);
 
     // Cashier tries to sneak into A (and types A's location as branch name).
     const c = await onboardCashier(token, inviteB.code, "sneaky@eggmart.test", {
@@ -241,7 +271,7 @@ describe("Cashier signup assigns the invite's shop", () => {
 
   it("an invite is single-use: a second signup with the same code is rejected", async () => {
     const { token, shopB } = await adminWithTwoShops();
-    const invite = JSON.parse((await generateInvite(token, { shopId: shopB.id })).payload).data;
+    const invite = await inviteFor(token, shopB.id);
     await onboardCashier(token, invite.code, "first@eggmart.test");
 
     const verify = await app.inject({ method: "POST", url: "/api/auth/signup/verify-invitation", payload: { code: invite.code } });
@@ -254,8 +284,8 @@ describe("Cashier signup assigns the invite's shop", () => {
 describe("Authenticated cashier scoping — Shop A vs Shop B", () => {
   async function twoCashiersWithData() {
     const { token, shopA, shopB } = await adminWithTwoShops();
-    const inviteA = JSON.parse((await generateInvite(token, { shopId: shopA.id })).payload).data;
-    const inviteB = JSON.parse((await generateInvite(token, { shopId: shopB.id })).payload).data;
+    const inviteA = await inviteFor(token, shopA.id);
+    const inviteB = await inviteFor(token, shopB.id);
     const cashierA = await onboardCashier(token, inviteA.code, "cashier1@eggmart.test");
     const cashierB = await onboardCashier(token, inviteB.code, "cashier2@eggmart.test");
 
