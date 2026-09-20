@@ -2,9 +2,14 @@
  * Integration tests for cashier shop assignment: invite → signup → approval
  * → login → authenticated shop scoping, plus Shop A vs Shop B isolation.
  *
- * Regression target: every new cashier ended up on "Egg Mart — Main Branch"
- * because invitation codes were stamped with the admin's mutable *active*
- * shop (User.shopId) instead of an explicit, ownership-checked target shop.
+ * RBR Egg Mart V2 Phase 1 (invitation code / branch-name rework): an
+ * invitation code is now generic (never tied to any shop, never taken from
+ * or displayed with the Global Shop Selector) and the shop a cashier joins
+ * is resolved at signup time from the Branch Name they themselves type in
+ * — see src/lib/shopAccess.ts resolveOrCreateShopByLocation and
+ * src/routes/auth.ts POST /signup. This file replaces an earlier version
+ * that asserted the opposite (invitation codes carrying an explicit target
+ * shopId) — that was the bug this rework fixes.
  *
  * Same constraints as the other test/*.integration.test.ts files — needs a
  * real Postgres database, excluded from the default sandboxed `npm test`
@@ -18,7 +23,6 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
 import { buildApp } from "../src/app.js";
 import { prisma } from "../src/lib/prisma.js";
-import { hashPassword } from "../src/lib/password.js";
 import { resetDb } from "./dbReset.js";
 
 let app: FastifyInstance;
@@ -74,34 +78,37 @@ function nextIp() {
   return `10.${(ipCounter >> 8) & 255}.${ipCounter & 255}.1`;
 }
 
-function generateInvite(token: string, payload?: Record<string, unknown>) {
+// Invitation codes are generic (Phase 1 rework): generating one takes no
+// body at all — there is no shop to target.
+function generateInvite(token: string) {
   return app.inject({
     method: "POST",
     url: "/api/admin/invitation-codes",
     headers: auth(token),
-    payload,
     remoteAddress: nextIp(),
   });
 }
 
-type InviteData = { id: string; code: string; shop: { id: string; name: string } };
+type InviteData = { id: string; code: string };
 
 /** generateInvite + assert success. Fails with the real status/body instead of
  * a confusing "undefined.code" TypeError further down. */
-async function inviteFor(token: string, shopId: string): Promise<InviteData> {
-  const res = await generateInvite(token, { shopId });
+async function inviteFor(token: string): Promise<InviteData> {
+  const res = await generateInvite(token);
   if (res.statusCode !== 201) {
-    throw new Error(`generateInvite(${shopId}) failed: ${res.statusCode} ${res.payload}`);
+    throw new Error(`generateInvite failed: ${res.statusCode} ${res.payload}`);
   }
   return JSON.parse(res.payload).data as InviteData;
 }
 
-/** Full cashier lifecycle through the real HTTP API: verify code → signup →
- * admin approves → cashier logs in. Returns the cashier's token + login body. */
+/** Full cashier lifecycle through the real HTTP API: verify code → signup (with
+ * the given Branch Name) → admin approves → cashier logs in. Returns the
+ * cashier's token + login body. */
 async function onboardCashier(
   adminToken: string,
   code: string,
   email: string,
+  branchName: string,
   extraSignupFields: Record<string, unknown> = {}
 ) {
   const verify = await app.inject({ method: "POST", url: "/api/auth/signup/verify-invitation", payload: { code } });
@@ -115,7 +122,7 @@ async function onboardCashier(
       name: email.split("@")[0],
       email,
       password: "Password123",
-      branchName: "Whatever the cashier typed",
+      branchName,
       verificationToken,
       ...extraSignupFields,
     },
@@ -136,143 +143,143 @@ async function onboardCashier(
   return { id: requestId as string, token: body.token as string, cashier: body.cashier };
 }
 
-// ── §1 Invite carries the explicit target shop ──────────────────────────
+// ── §1 Invitation codes are generic — never shop-scoped ──────────────────
 
-describe("POST /api/admin/invitation-codes — explicit target shop", () => {
-  it("stamps the invite with the requested shop, NOT the admin's currently active shop", async () => {
+describe("POST /api/admin/invitation-codes — generic, not shop-scoped", () => {
+  it("generates a code with no shop attached, regardless of a shopId in the body", async () => {
+    const { token, shopA } = await adminWithTwoShops();
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/api/admin/invitation-codes",
+      headers: auth(token),
+      payload: { shopId: shopA.id },
+      remoteAddress: nextIp(),
+    });
+    expect(res.statusCode).toBe(201);
+    const body = JSON.parse(res.payload);
+    expect(body.data.shop).toBeUndefined();
+
+    const row = await prisma.invitationCode.findUniqueOrThrow({ where: { id: body.data.id } });
+    expect(row.shopId).toBeNull();
+  });
+
+  it("stays generic no matter which shop the Global Shop Selector has active", async () => {
     const { token, shopA, shopB } = await adminWithTwoShops();
-    // Sanity: the admin's active shop is A (first shop) …
+    // Admin's active shop is A (first shop signed up for) — see adminWithTwoShops.
     const me = await prisma.user.findUniqueOrThrow({ where: { email: "owner@rbr.test" } });
     expect(me.shopId).toBe(shopA.id);
 
-    // … yet an invite requested for B must belong to B.
-    const res = await generateInvite(token, { shopId: shopB.id });
-    expect(res.statusCode).toBe(201);
-    const body = JSON.parse(res.payload);
-    expect(body.data.shop.id).toBe(shopB.id);
-    expect(body.data.shop.name).toBe(shopB.name);
+    const whileOnA = await inviteFor(token);
+    const rowA = await prisma.invitationCode.findUniqueOrThrow({ where: { id: whileOnA.id } });
+    expect(rowA.shopId).toBeNull();
 
-    const row = await prisma.invitationCode.findUniqueOrThrow({ where: { id: body.data.id } });
-    expect(row.shopId).toBe(shopB.id);
+    // Switch the admin's active shop to B, generate again — still generic.
+    await app.inject({
+      method: "POST",
+      url: "/api/admin/shops/switch",
+      headers: auth(token),
+      payload: { shopId: shopB.id },
+    });
+    const whileOnB = await inviteFor(token);
+    const rowB = await prisma.invitationCode.findUniqueOrThrow({ where: { id: whileOnB.id } });
+    expect(rowB.shopId).toBeNull();
   });
 
-  it("rejects a request with no shopId (no implicit / default shop)", async () => {
+  it("keeps one ACTIVE code per admin — generating a new one revokes the previous one, even across their different shops", async () => {
     const { token } = await adminWithTwoShops();
-    const res = await generateInvite(token);
-    // Schema-validation failures in this API return 422 (not 400).
-    expect(res.statusCode).toBe(422);
-    expect(await prisma.invitationCode.count()).toBe(0);
-  });
+    const first = await inviteFor(token);
+    const second = await inviteFor(token);
 
-  it("rejects a shop the admin does not own, including another admin's shop", async () => {
-    const { token } = await adminWithTwoShops();
-    const other = await adminSignup("other@rbr.test", "Singanallur");
-
-    const res = await generateInvite(token, { shopId: other.shop.id });
-    expect(res.statusCode).toBe(403);
-    expect(JSON.parse(res.payload).code).toBe("SHOP_ACCESS_DENIED");
-
-    const bogus = await generateInvite(token, { shopId: "does-not-exist" });
-    expect(bogus.statusCode).toBe(403);
-    expect(await prisma.invitationCode.count()).toBe(0);
-  });
-
-  it("keeps one ACTIVE code per shop — generating for B does not revoke A's code", async () => {
-    const { token, shopA, shopB } = await adminWithTwoShops();
-    const a = await inviteFor(token, shopA.id);
-    const b = await inviteFor(token, shopB.id);
-
-    const rowA = await prisma.invitationCode.findUniqueOrThrow({ where: { id: a.id } });
-    const rowB = await prisma.invitationCode.findUniqueOrThrow({ where: { id: b.id } });
-    expect(rowA.status).toBe("ACTIVE");
-    expect(rowB.status).toBe("ACTIVE");
+    const firstRow = await prisma.invitationCode.findUniqueOrThrow({ where: { id: first.id } });
+    const secondRow = await prisma.invitationCode.findUniqueOrThrow({ where: { id: second.id } });
+    expect(firstRow.status).toBe("REVOKED");
+    expect(secondRow.status).toBe("ACTIVE");
   });
 });
 
-describe("GET /api/admin/invitation-codes/active — per-shop, never stale", () => {
-  it("returns only the requested shop's code and labels it with that shop", async () => {
-    const { token, shopA, shopB } = await adminWithTwoShops();
-    const a = await inviteFor(token, shopA.id);
-    const b = await inviteFor(token, shopB.id);
+describe("GET /api/admin/invitation-codes/active — this admin's one code", () => {
+  it("returns the requesting admin's own code with no shop attached", async () => {
+    const { token } = await adminWithTwoShops();
+    const created = await inviteFor(token);
 
-    const resA = await app.inject({ method: "GET", url: `/api/admin/invitation-codes/active?shopId=${shopA.id}`, headers: auth(token) });
-    const resB = await app.inject({ method: "GET", url: `/api/admin/invitation-codes/active?shopId=${shopB.id}`, headers: auth(token) });
-    expect(JSON.parse(resA.payload).data.code).toBe(a.code);
-    expect(JSON.parse(resA.payload).data.shop.id).toBe(shopA.id);
-    expect(JSON.parse(resB.payload).data.code).toBe(b.code);
-    expect(JSON.parse(resB.payload).data.shop.id).toBe(shopB.id);
+    const res = await app.inject({ method: "GET", url: "/api/admin/invitation-codes/active", headers: auth(token) });
+    expect(JSON.parse(res.payload).data.code).toBe(created.code);
+    expect(JSON.parse(res.payload).data.shop).toBeUndefined();
   });
 
-  it("returns null when the requested shop has no active code, and 403 for a shop not owned", async () => {
-    const { token, shopA, shopB } = await adminWithTwoShops();
-    await generateInvite(token, { shopId: shopA.id });
-
-    const none = await app.inject({ method: "GET", url: `/api/admin/invitation-codes/active?shopId=${shopB.id}`, headers: auth(token) });
-    expect(JSON.parse(none.payload).data).toBeNull();
-
+  it("never returns another admin's code", async () => {
+    const { token } = await adminWithTwoShops();
     const other = await adminSignup("other@rbr.test", "Singanallur");
-    const denied = await app.inject({ method: "GET", url: `/api/admin/invitation-codes/active?shopId=${other.shop.id}`, headers: auth(token) });
-    expect(denied.statusCode).toBe(403);
+    await inviteFor(other.token);
+
+    const res = await app.inject({ method: "GET", url: "/api/admin/invitation-codes/active", headers: auth(token) });
+    expect(JSON.parse(res.payload).data).toBeNull();
   });
 });
 
 describe("POST /api/admin/invitation-codes/:id/revoke", () => {
-  it("revokes a code for an owned shop even when that shop is not the active one", async () => {
-    const { token, shopB } = await adminWithTwoShops();
-    const b = await inviteFor(token, shopB.id);
-    const res = await app.inject({ method: "POST", url: `/api/admin/invitation-codes/${b.id}/revoke`, headers: auth(token) });
+  it("revokes the requesting admin's own code", async () => {
+    const { token } = await adminWithTwoShops();
+    const created = await inviteFor(token);
+    const res = await app.inject({ method: "POST", url: `/api/admin/invitation-codes/${created.id}/revoke`, headers: auth(token) });
     expect(res.statusCode).toBe(200);
   });
 
   it("reports another admin's code as not found", async () => {
     const { token } = await adminWithTwoShops();
     const other = await adminSignup("other@rbr.test", "Singanallur");
-    const theirs = await inviteFor(other.token, other.shop.id);
+    const theirs = await inviteFor(other.token);
     const res = await app.inject({ method: "POST", url: `/api/admin/invitation-codes/${theirs.id}/revoke`, headers: auth(token) });
     expect(res.statusCode).toBe(404);
   });
 });
 
-// ── §2 Invite → signup → cashier → shop ─────────────────────────────────
+// ── §2 Cashier signup assigns the shop resolved from Branch Name ────────
 
-describe("Cashier signup assigns the invite's shop", () => {
-  it("two cashiers invited to two different shops end up in those two shops", async () => {
-    const { token, shopA, shopB } = await adminWithTwoShops();
-    const inviteA = await inviteFor(token, shopA.id);
-    const inviteB = await inviteFor(token, shopB.id);
+describe("Cashier signup resolves the shop from Branch Name", () => {
+  it("two cashiers signing up with the same code but different branch names end up in two different (auto-created) shops", async () => {
+    const { token } = await adminWithTwoShops();
+    const invite = await inviteFor(token);
 
-    const c1 = await onboardCashier(token, inviteA.code, "cashier1@eggmart.test");
-    const c2 = await onboardCashier(token, inviteB.code, "cashier2@eggmart.test");
+    const c1 = await onboardCashier(token, invite.code, "cashier1@eggmart.test", "Coimbatore");
+    // A single-use code — mint a fresh one for the second cashier.
+    const invite2 = await inviteFor(token);
+    const c2 = await onboardCashier(token, invite2.code, "cashier2@eggmart.test", "RS Puram");
 
-    expect(c1.cashier.shop.id).toBe(shopA.id);
-    expect(c2.cashier.shop.id).toBe(shopB.id);
+    expect(c1.cashier.shop.name).toContain("Coimbatore");
+    expect(c2.cashier.shop.name).toContain("RS Puram");
     expect(c1.cashier.shop.id).not.toBe(c2.cashier.shop.id);
-
-    // Persisted, not just serialized:
-    expect((await prisma.user.findUniqueOrThrow({ where: { id: c1.id } })).shopId).toBe(shopA.id);
-    expect((await prisma.user.findUniqueOrThrow({ where: { id: c2.id } })).shopId).toBe(shopB.id);
-
-    // /auth/me (what the Cashier Profile page displays) agrees:
-    const meB = await app.inject({ method: "GET", url: "/api/auth/me", headers: auth(c2.token) });
-    expect(JSON.parse(meB.payload).shop.name).toBe(shopB.name);
   });
 
-  it("ignores any shopId / shop info the cashier frontend tries to send at signup", async () => {
-    const { token, shopA, shopB } = await adminWithTwoShops();
-    const inviteB = await inviteFor(token, shopB.id);
+  it("reuses an existing shop rather than creating a duplicate, and normalizes casing/whitespace", async () => {
+    const { token, shopA } = await adminWithTwoShops(); // shopA.location === "Veerapandi"
+    const invite = await inviteFor(token);
 
-    // Cashier tries to sneak into A (and types A's location as branch name).
-    const c = await onboardCashier(token, inviteB.code, "sneaky@eggmart.test", {
+    const c = await onboardCashier(token, invite.code, "cashier@eggmart.test", "  veerapandi ");
+    expect(c.cashier.shop.id).toBe(shopA.id);
+
+    const shopsNamedVeerapandi = await prisma.shop.count({ where: { location: { equals: "Veerapandi", mode: "insensitive" } } });
+    expect(shopsNamedVeerapandi).toBe(1);
+  });
+
+  it("ignores any shopId the cashier frontend tries to send at signup — only Branch Name decides the shop", async () => {
+    const { token, shopA } = await adminWithTwoShops();
+    const invite = await inviteFor(token);
+
+    // Cashier tries to sneak directly into shop A via a raw shopId while
+    // typing an unrelated branch name.
+    const c = await onboardCashier(token, invite.code, "sneaky@eggmart.test", "Brand New Branch", {
       shopId: shopA.id,
-      branchName: shopA.location,
     });
-    expect(c.cashier.shop.id).toBe(shopB.id);
+    expect(c.cashier.shop.id).not.toBe(shopA.id);
+    expect(c.cashier.shop.name).toContain("Brand New Branch");
   });
 
   it("an invite is single-use: a second signup with the same code is rejected", async () => {
-    const { token, shopB } = await adminWithTwoShops();
-    const invite = await inviteFor(token, shopB.id);
-    await onboardCashier(token, invite.code, "first@eggmart.test");
+    const { token } = await adminWithTwoShops();
+    const invite = await inviteFor(token);
+    await onboardCashier(token, invite.code, "first@eggmart.test", "Peelamedu");
 
     const verify = await app.inject({ method: "POST", url: "/api/auth/signup/verify-invitation", payload: { code: invite.code } });
     expect(verify.statusCode).toBe(409);
@@ -284,10 +291,10 @@ describe("Cashier signup assigns the invite's shop", () => {
 describe("Authenticated cashier scoping — Shop A vs Shop B", () => {
   async function twoCashiersWithData() {
     const { token, shopA, shopB } = await adminWithTwoShops();
-    const inviteA = await inviteFor(token, shopA.id);
-    const inviteB = await inviteFor(token, shopB.id);
-    const cashierA = await onboardCashier(token, inviteA.code, "cashier1@eggmart.test");
-    const cashierB = await onboardCashier(token, inviteB.code, "cashier2@eggmart.test");
+    const inviteA = await inviteFor(token);
+    const cashierA = await onboardCashier(token, inviteA.code, "cashier1@eggmart.test", shopA.location);
+    const inviteB = await inviteFor(token);
+    const cashierB = await onboardCashier(token, inviteB.code, "cashier2@eggmart.test", shopB.location);
 
     const mk = (shopId: string, name: string, barcode: string) =>
       prisma.product.create({

@@ -222,8 +222,17 @@ model AdminShopLink {
 // endpoint, and only to the admin of the owning shop.
 model InvitationCode {
   id     String @id @default(uuid())
-  shopId String
-  shop   Shop   @relation(fields: [shopId], references: [id])
+
+  // RBR Egg Mart V2 Phase 1: a code no longer belongs to a shop. It is a
+  // generic "authorized to register as a cashier" grant, scoped to the
+  // admin who created it (createdByAdminId) — never to a shop. The shop a
+  // cashier joins is decided later, at signup, from their own Branch Name
+  // (see src/lib/shopAccess.ts resolveOrCreateShopByLocation and
+  // src/routes/auth.ts POST /signup). Column kept nullable, rather than
+  // dropped, purely so historical rows retain their original shop for
+  // audit purposes — no code path reads or writes it for new codes.
+  shopId String?
+  shop   Shop?   @relation(fields: [shopId], references: [id], onDelete: SetNull)
 
   codeHash  String
   codePlain String?

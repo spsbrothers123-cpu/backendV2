@@ -1,36 +1,38 @@
 import type { FastifyInstance } from "fastify";
 import { prisma } from "../../lib/prisma.js";
-import { z } from "zod";
-import { Errors } from "../../lib/errors.js";
-import { parseBody } from "../../lib/validate.js";
-import { recordAudit } from "../../lib/audit.js";
-import { assertAdminOwnsShop } from "../../lib/shopAccess.js";
 import {
   generateInvitationCode,
   hashInvitationCode,
   invitationCodeExpiryDate,
 } from "../../lib/invitationCode.js";
+import { Errors } from "../../lib/errors.js";
+import { recordAudit } from "../../lib/audit.js";
 
 // Cap on regeneration attempts if a freshly-generated code happens to
-// collide (by hash) with another shop's currently-ACTIVE code. With only
+// collide (by hash) with another admin's currently-ACTIVE code. With only
 // 1,000,000 possible 6-digit codes and typically a handful of ACTIVE codes
 // system-wide at once, this is astronomically unlikely to ever loop more
 // than once — it exists purely so validate-by-hash-lookup (routes/auth.ts)
-// can never accidentally match the wrong shop's code.
+// can never accidentally match the wrong code.
 const MAX_GENERATION_ATTEMPTS = 5;
 
-// The invitation's shop is what a cashier who signs up with this code will
-// be permanently assigned to (see routes/auth.ts /signup), so the response
-// always says which shop that is — the Admin UI shows it next to the code so
-// an admin can never hand out a code without knowing where it will place
-// the new cashier.
+// RBR Egg Mart V2 Phase 1: an invitation code is generic — "authorized to
+// register as an Egg Mart cashier" — and is NOT tied to any shop. It must
+// never be generated from, filtered by, or displayed with the Admin app's
+// Global Shop Selector (whichever shop happens to be currently active).
+// The shop a cashier ends up in is decided later, at signup, from the
+// Branch Name they themselves type in (see src/lib/shopAccess.ts
+// resolveOrCreateShopByLocation and src/routes/auth.ts POST /signup).
+//
+// A code is scoped to the admin who created it (createdByAdminId) — that
+// admin owns/manages it (can see it, regenerate it, revoke it) regardless
+// of which shop they currently have selected or how many shops they own.
 function toInvitationCodeResponse(invitation: {
   id: string;
   codePlain: string | null;
   status: string;
   createdAt: Date;
   expiresAt: Date;
-  shop: { id: string; name: string; location: string | null };
 }) {
   return {
     id: invitation.id,
@@ -38,43 +40,27 @@ function toInvitationCodeResponse(invitation: {
     status: invitation.status,
     createdAt: invitation.createdAt.toISOString(),
     expiresAt: invitation.expiresAt.toISOString(),
-    shop: {
-      id: invitation.shop.id,
-      name: invitation.shop.name,
-      location: invitation.shop.location ?? undefined,
-    },
   };
 }
-
-// The target shop is explicit on every call. It is NOT taken from
-// request.authUser.shopId: that column is the admin's mutable "currently
-// active shop" (changed by POST /admin/shops/switch), and the Cashiers page
-// is deliberately shop-independent, so an implicit shop here meant a code
-// could silently be minted for — or displayed from — a different shop than
-// the one the admin was looking at (typically the seeded "Main Branch").
-// Ownership of the requested shop is re-verified server-side every time.
-const shopTargetSchema = z.object({
-  shopId: z.string().trim().min(1, "shopId is required."),
-});
 
 export default async function adminInvitationCodesRoutes(fastify: FastifyInstance) {
   fastify.addHook("preHandler", fastify.requireRole("ADMIN"));
 
   // ── POST /api/admin/invitation-codes ─────────────────────────────────
-  // Generates a new invitation code for the admin's own shop, revoking any
-  // existing ACTIVE code first — a shop only ever has one live code
-  // (Backend spec §5). Rate limited to slow down abuse/enumeration.
+  // Generates a new, generic invitation code for the requesting admin,
+  // revoking any existing ACTIVE code of theirs first — an admin only ever
+  // has one live code at a time (Backend spec §5, reinterpreted as
+  // per-admin rather than per-shop for Phase 1). Rate limited to slow down
+  // abuse/enumeration. Takes no body: there is no shop to target.
   fastify.post(
     "/",
     { config: { rateLimit: { max: 20, timeWindow: "10 minutes" } } },
     async (request, reply) => {
       const admin = request.authUser!;
-      const body = parseBody(shopTargetSchema, request.body);
-      const shop = await assertAdminOwnsShop(admin.id, body.shopId);
 
       const invitation = await prisma.$transaction(async (tx) => {
         await tx.invitationCode.updateMany({
-          where: { shopId: shop.id, status: "ACTIVE" },
+          where: { createdByAdminId: admin.id, status: "ACTIVE" },
           data: { status: "REVOKED", codePlain: null },
         });
 
@@ -88,9 +74,7 @@ export default async function adminInvitationCodesRoutes(fastify: FastifyInstanc
         }
 
         return tx.invitationCode.create({
-          include: { shop: true },
           data: {
-            shopId: shop.id,
             codeHash,
             codePlain: code,
             status: "ACTIVE",
@@ -104,7 +88,6 @@ export default async function adminInvitationCodesRoutes(fastify: FastifyInstanc
         action: "INVITATION_CODE_GENERATED",
         actorId: admin.id,
         actorRole: "ADMIN",
-        shopId: shop.id,
         entityType: "InvitationCode",
         entityId: invitation.id,
       });
@@ -116,13 +99,10 @@ export default async function adminInvitationCodesRoutes(fastify: FastifyInstanc
   // ── GET /api/admin/invitation-codes/active ───────────────────────────
   fastify.get("/active", async (request) => {
     const admin = request.authUser!;
-    const query = parseBody(shopTargetSchema, request.query);
-    const shop = await assertAdminOwnsShop(admin.id, query.shopId);
 
     let invitation = await prisma.invitationCode.findFirst({
-      where: { shopId: shop.id, status: "ACTIVE" },
+      where: { createdByAdminId: admin.id, status: "ACTIVE" },
       orderBy: { createdAt: "desc" },
-      include: { shop: true },
     });
 
     // Lazily flip a stale-but-still-marked-ACTIVE code to EXPIRED so the
@@ -143,15 +123,11 @@ export default async function adminInvitationCodesRoutes(fastify: FastifyInstanc
     const admin = request.authUser!;
     const invitation = await prisma.invitationCode.findUnique({ where: { id: request.params.id } });
 
-    // Authorize against every shop this admin owns (not just the currently
-    // active one). A code for a shop they don't own is reported as "not
-    // found" so its existence isn't revealed.
-    if (!invitation) {
+    // A code that doesn't exist, or belongs to a different admin, is
+    // reported as "not found" so its existence isn't revealed.
+    if (!invitation || invitation.createdByAdminId !== admin.id) {
       throw Errors.notFound("Invitation code not found.", "INVITATION_CODE_NOT_FOUND");
     }
-    await assertAdminOwnsShop(admin.id, invitation.shopId).catch(() => {
-      throw Errors.notFound("Invitation code not found.", "INVITATION_CODE_NOT_FOUND");
-    });
     if (invitation.status !== "ACTIVE") {
       throw Errors.conflict("Only an active invitation code can be revoked.", "INVITATION_CODE_NOT_ACTIVE");
     }
@@ -165,7 +141,6 @@ export default async function adminInvitationCodesRoutes(fastify: FastifyInstanc
       action: "INVITATION_CODE_REVOKED",
       actorId: admin.id,
       actorRole: "ADMIN",
-      shopId: invitation.shopId,
       entityType: "InvitationCode",
       entityId: updated.id,
     });

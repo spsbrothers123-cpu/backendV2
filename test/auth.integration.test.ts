@@ -70,7 +70,6 @@ async function generateInvitationCode() {
     method: "POST",
     url: "/api/admin/invitation-codes",
     headers: { authorization: `Bearer ${adminToken}` },
-    payload: { shopId },
   });
   expect(res.statusCode).toBe(201);
   const body = JSON.parse(res.payload);
@@ -139,6 +138,12 @@ describe("Cashier signup → invitation code → approval → login", () => {
     const body = JSON.parse(finalLogin.payload);
     expect(body.token).toBeTruthy();
     expect(body.cashier.active).toBe(true);
+
+    // The cashier's shop comes from the Branch Name they typed at signup
+    // ("Test Branch"), NOT from the admin's shop the invitation code was
+    // generated under ("Test Shop") — a code is no longer shop-scoped.
+    expect(body.cashier.shop.id).not.toBe(shopId);
+    expect(body.cashier.shop.name).toContain("Test Branch");
   });
 
   it("rejects an invalid invitation code", async () => {
@@ -156,7 +161,7 @@ describe("Cashier signup → invitation code → approval → login", () => {
     expect(JSON.parse(res.payload).code).toBe("INVITATION_CODE_EXPIRED");
   });
 
-  it("only ever allows one ACTIVE code per shop — generating a new one revokes the old one", async () => {
+  it("only ever allows one ACTIVE code per admin — generating a new one revokes the old one", async () => {
     const first = await generateInvitationCode();
     const second = await generateInvitationCode();
 

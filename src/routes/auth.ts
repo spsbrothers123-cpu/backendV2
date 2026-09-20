@@ -110,12 +110,10 @@ export default async function authRoutes(fastify: FastifyInstance) {
         );
       }
 
-      const shop = await prisma.shop.findUnique({ where: { id: invitation.shopId } });
-      if (!shop) {
-        throw Errors.internal("The shop for this invitation code no longer exists.");
-      }
-
-      const verificationToken = signInvitationToken(invitation.id, invitation.shopId);
+      // RBR Egg Mart V2 Phase 1: the invitation carries no shop — it only
+      // authorizes registering as a cashier. The shop is resolved later,
+      // in POST /signup, from the Branch Name the cashier enters there.
+      const verificationToken = signInvitationToken(invitation.id);
 
       return {
         verificationToken,
@@ -169,6 +167,18 @@ export default async function authRoutes(fastify: FastifyInstance) {
 
       const passwordHash = await hashPassword(body.password);
 
+      // RBR Egg Mart V2 Phase 1: the shop is resolved from the cashier's own
+      // Branch Name, never from the invitation code (which carries no shop
+      // — see routes/admin/invitationCodes.ts and lib/invitationToken.ts).
+      // Reuses the same find-or-create-by-location logic as Admin signup
+      // (lib/shopAccess.ts) so "Chennai" / "chennai" / " CHENNAI " all
+      // resolve to one shop and a brand-new branch name creates a real
+      // Shop row automatically (Backend spec §6-§9). Done outside the
+      // transaction below, same as admin/signup: resolveOrCreateShopByLocation
+      // is independently race-safe (unique constraint + catch-and-refetch),
+      // so it doesn't need to share a transaction with the invitation claim.
+      const { shop } = await resolveOrCreateShopByLocation(body.branchName);
+
       // Everything below is one atomic unit: the invitation code can only
       // ever produce ONE successful cashier signup (Backend spec §12/§13).
       // The conditional updateMany is the concurrency guard — of two
@@ -185,10 +195,6 @@ export default async function authRoutes(fastify: FastifyInstance) {
         }
 
         const invitation = await tx.invitationCode.findUniqueOrThrow({ where: { id: tokenPayload.invitationId } });
-        const shop = await tx.shop.findUnique({ where: { id: invitation.shopId } });
-        if (!shop) {
-          throw Errors.internal("The shop for this invitation code no longer exists.");
-        }
 
         // Reconstruct the masked form from the plaintext code one last
         // time before it's cleared for good — never store/log the full code.
