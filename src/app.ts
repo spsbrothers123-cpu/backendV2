@@ -35,6 +35,7 @@ import adminNotificationsRoutes from "./routes/admin/notifications.js";
 import adminProfileRoutes from "./routes/admin/profile.js";
 import adminSearchRoutes from "./routes/admin/search.js";
 import adminSettingsRoutes from "./routes/admin/settings.js";
+import adminConsolidationRoutes from "./routes/admin/consolidation.js";
 
 export async function buildApp(): Promise<FastifyInstance> {
   const app = Fastify({
@@ -96,6 +97,7 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(adminProfileRoutes, { prefix: "/api/admin/profile" });
   await app.register(adminSearchRoutes, { prefix: "/api/admin/search" });
   await app.register(adminSettingsRoutes, { prefix: "/api/admin/settings" });
+  await app.register(adminConsolidationRoutes, { prefix: "/api/admin/consolidation" });
 
   // ── Centralized error handling — every route throws, nothing formats
   // its own error response, so the JSON body shape is consistent everywhere.
