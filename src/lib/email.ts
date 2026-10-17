@@ -61,6 +61,22 @@ export async function sendCashierRejected(to: string, name: string, reason?: str
   await send(to, subject, html, text);
 }
 
+// RBR Egg Mart V2 Phase 1: Forgot Password (Admin + Cashier). `resetUrl`
+// already points at the right frontend (Admin app vs Cashier app) and
+// carries the one-time token as a query param — see routes/auth.ts. The
+// token itself is never included anywhere else in this email.
+export async function sendPasswordReset(to: string, name: string, resetUrl: string) {
+  const subject = "Egg Mart — Reset Your Password";
+  const text = `Hi ${name},\n\nWe received a request to reset your Egg Mart password. Click the link below to choose a new password:\n\n${resetUrl}\n\nThis link expires soon and can only be used once. If you didn't request this, you can safely ignore this email — your password will not change.\n\n— Egg Mart`;
+  const html = wrapHtml(
+    `<p>Hi ${escapeHtml(name)},</p>
+     <p>We received a request to reset your Egg Mart password.</p>
+     <p><a href="${resetUrl}" style="display:inline-block;background:#b45309;color:#fff;padding:10px 18px;border-radius:6px;text-decoration:none;">Reset your password</a></p>
+     <p style="font-size:13px;color:#666;">This link expires soon and can only be used once.</p>`
+  );
+  await send(to, subject, html, text);
+}
+
 function escapeHtml(value: string): string {
   return value
     .replace(/&/g, "&amp;")

@@ -276,6 +276,51 @@ describe("Cashier signup resolves the shop from Branch Name", () => {
     expect(c.cashier.shop.name).toContain("Brand New Branch");
   });
 
+  it("approval keeps the cashier's own shop no matter which shop the admin has selected at that moment", async () => {
+    const { token, shopA, shopB } = await adminWithTwoShops();
+
+    // Two cashiers sign up (approval deliberately NOT done yet): one for
+    // shop A's branch, one for shop B's.
+    async function signupOnly(email: string, branchName: string) {
+      const invite = await inviteFor(token);
+      const verify = await app.inject({ method: "POST", url: "/api/auth/signup/verify-invitation", payload: { code: invite.code } });
+      expect(verify.statusCode).toBe(200);
+      const { verificationToken } = JSON.parse(verify.payload);
+      const signup = await app.inject({
+        method: "POST",
+        url: "/api/auth/signup",
+        payload: { name: email.split("@")[0], email, password: "Password123", branchName, verificationToken },
+      });
+      expect(signup.statusCode).toBe(201);
+      return JSON.parse(signup.payload).requestId as string;
+    }
+    const requestA = await signupOnly("toA@eggmart.test", shopA.location);
+    const requestB = await signupOnly("toB@eggmart.test", shopB.location);
+
+    async function selectShop(shopId: string) {
+      const res = await app.inject({ method: "POST", url: "/api/admin/shops/switch", headers: auth(token), payload: { shopId } });
+      expect(res.statusCode).toBe(200);
+    }
+    async function approve(requestId: string) {
+      const res = await app.inject({ method: "POST", url: `/api/admin/cashier-requests/${requestId}/approve`, headers: auth(token) });
+      expect(res.statusCode).toBe(200);
+    }
+
+    // Approve A's cashier while B is selected, and B's cashier while A is
+    // selected — the exact "wrong selector" case in both directions.
+    await selectShop(shopB.id);
+    await approve(requestA);
+    await selectShop(shopA.id);
+    await approve(requestB);
+
+    const cashierA = await prisma.user.findUniqueOrThrow({ where: { id: requestA } });
+    const cashierB = await prisma.user.findUniqueOrThrow({ where: { id: requestB } });
+    expect(cashierA.status).toBe("ACTIVE");
+    expect(cashierB.status).toBe("ACTIVE");
+    expect(cashierA.shopId).toBe(shopA.id);
+    expect(cashierB.shopId).toBe(shopB.id);
+  });
+
   it("an invite is single-use: a second signup with the same code is rejected", async () => {
     const { token } = await adminWithTwoShops();
     const invite = await inviteFor(token);

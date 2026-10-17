@@ -28,6 +28,13 @@ const envSchema = z.object({
   // How long a verifyInvitationCode() token is valid for while the cashier
   // fills out the registration form.
   INVITATION_TOKEN_EXPIRY_MINUTES: z.coerce.number().default(15),
+
+  // Forgot Password (Admin + Cashier). How long a password-reset link is
+  // valid for, and which frontend origin each role's reset link points at
+  // (the two apps run on different ports/domains — see CORS_ORIGINS).
+  PASSWORD_RESET_TOKEN_EXPIRY_MINUTES: z.coerce.number().default(30),
+  ADMIN_APP_URL: z.string().default("http://localhost:5173"),
+  CASHIER_APP_URL: z.string().default("http://localhost:5174"),
 });
 
 const parsed = envSchema.safeParse(process.env);

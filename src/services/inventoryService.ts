@@ -134,6 +134,47 @@ export async function adjustStock(
 }
 
 /**
+ * RBR Egg Mart V2 Phase 1 — New Cashier Initialization.
+ *
+ * Creates a fresh CashierInventory row, quantity 0, for every product
+ * already in `shopId`'s catalog (the catalog itself stays exactly as it
+ * is — global/shared across every cashier of that shop, never filtered
+ * or duplicated per cashier). Called once, at the moment a cashier is
+ * approved (see routes/admin/cashierRequests.ts POST /:id/approve).
+ *
+ * This is a defensive/explicit step, not a functional prerequisite:
+ * getCashierStock/getCashierStockMap above already default an absent row
+ * to 0, and adjustStock lazily creates the row on first write — so a
+ * cashier with no rows at all already behaves identically to one with
+ * all-zero rows. Creating the rows up front just makes "this cashier's
+ * fresh inventory" a literal, queryable fact (e.g. for admin inventory
+ * screens that list CashierInventory rows directly) rather than an
+ * implicit default, and it can never overwrite another cashier's
+ * quantities — `skipDuplicates` means it only ever fills in gaps.
+ */
+export async function initializeCashierInventory(
+  tx: Prisma.TransactionClient | PrismaClient,
+  shopId: string,
+  cashierId: string
+): Promise<{ productsInitialized: number }> {
+  const products = await tx.product.findMany({
+    where: { shopId },
+    select: { id: true },
+  });
+
+  if (products.length === 0) {
+    return { productsInitialized: 0 };
+  }
+
+  const result = await tx.cashierInventory.createMany({
+    data: products.map((p) => ({ shopId, cashierId, productId: p.id, quantity: 0 })),
+    skipDuplicates: true,
+  });
+
+  return { productsInitialized: result.count };
+}
+
+/**
  * A specific cashier's current quantity for a product — 0 if they've never
  * had any (no row yet). This is the ONLY correct way to answer "how much
  * stock does this cashier have"; never Product.stock, which is a

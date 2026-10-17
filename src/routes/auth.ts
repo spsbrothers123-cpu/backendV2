@@ -7,6 +7,8 @@ import { parseBody } from "../lib/validate.js";
 import { hashPassword, verifyPassword, isPasswordStrongEnough } from "../lib/password.js";
 import { hashInvitationCode, invitationCodeMatches, maskInvitationCode } from "../lib/invitationCode.js";
 import { signInvitationToken, verifyInvitationToken } from "../lib/invitationToken.js";
+import { signPasswordResetToken, verifyPasswordResetToken, passwordFingerprint } from "../lib/passwordResetToken.js";
+import { sendPasswordReset } from "../lib/email.js";
 import { recordAudit } from "../lib/audit.js";
 import { issueSession, revokeSession } from "../lib/session.js";
 import { toPublicAdminUser, toPublicCashier } from "../lib/serializers.js";
@@ -42,6 +44,22 @@ const registerSchema = z.object({
 
 const signupStatusQuerySchema = z.object({
   requestId: z.string().trim().min(1, "requestId is required."),
+});
+
+// ── Forgot Password — Admin + Cashier (RBR Egg Mart V2 Phase 1) ─────────
+// One shared pair of endpoints for both roles: email is globally unique
+// across the User table (see schema.prisma), so there's nothing
+// role-specific about "look up this email and email it a reset link" —
+// only the reset link's destination (Admin app vs Cashier app) differs,
+// and that's resolved server-side from the found user's own role, never
+// from a role the caller claims.
+const forgotPasswordSchema = z.object({
+  email: emailSchema,
+});
+
+const resetPasswordSchema = z.object({
+  token: z.string().trim().min(1, "Reset token is required."),
+  password: z.string().min(1, "Password is required."),
 });
 
 // ── Admin signup — multi-shop foundation (RBR Egg Mart Phase 1) ─────────
@@ -484,6 +502,131 @@ export default async function authRoutes(fastify: FastifyInstance) {
       });
 
       return { token, user: toPublicAdminUser(user) };
+    }
+  );
+
+  // ── POST /api/auth/forgot-password — Admin + Cashier ─────────────────
+  // Body: { email }. Always returns the same generic success response
+  // whether or not the email is on file, whether the account is a
+  // cashier or admin, and whatever the account's status is — this
+  // endpoint is unauthenticated, so it must never let a caller learn
+  // anything about which emails have accounts (Backend spec: no user
+  // enumeration). If (and only if) a matching, non-suspended account
+  // exists, a one-time reset link is emailed to it, pointed at whichever
+  // frontend that account actually logs into.
+  fastify.post(
+    "/forgot-password",
+    { config: authRateLimit(5, "10 minutes") },
+    async (request) => {
+      const body = parseBody(forgotPasswordSchema, request.body);
+      const genericResponse = {
+        success: true,
+        data: null,
+        message: "If an account exists for that email, we've sent a password reset link.",
+      };
+
+      const user = await prisma.user.findUnique({ where: { email: body.email } });
+
+      // No account, or an account that isn't in a state that can log in
+      // anyway (pending approval / rejected / suspended) — say nothing
+      // different to the caller, but also don't send an email that would
+      // just confuse someone whose request was never approved.
+      if (!user || user.status !== "ACTIVE") {
+        return genericResponse;
+      }
+
+      const resetToken = signPasswordResetToken(user.id, user.passwordHash);
+      const appUrl = user.role === "ADMIN" ? env.ADMIN_APP_URL : env.CASHIER_APP_URL;
+      const resetPath = user.role === "ADMIN" ? "/admin/reset-password" : "/cashier/reset-password";
+      const resetUrl = `${appUrl}${resetPath}?token=${encodeURIComponent(resetToken)}`;
+
+      await sendPasswordReset(user.email, user.name, resetUrl);
+
+      await recordAudit({
+        action: "PASSWORD_RESET_REQUESTED",
+        actorId: user.id,
+        actorRole: user.role,
+        shopId: user.shopId,
+        entityType: "User",
+        entityId: user.id,
+      });
+
+      return genericResponse;
+    }
+  );
+
+  // ── POST /api/auth/reset-password — Admin + Cashier ──────────────────
+  // Body: { token, password }. The token embeds which user it's for and a
+  // fingerprint of their password at issue time (see
+  // lib/passwordResetToken.ts) — nothing about the caller's own session
+  // (there isn't one; this is unauthenticated by design, same as
+  // /forgot-password) needs to be trusted beyond the token itself.
+  fastify.post(
+    "/reset-password",
+    { config: authRateLimit(10, "10 minutes") },
+    async (request) => {
+      const body = parseBody(resetPasswordSchema, request.body);
+
+      let payload;
+      try {
+        payload = verifyPasswordResetToken(body.token);
+      } catch (reason) {
+        if (reason === "EXPIRED") {
+          throw Errors.unauthorized(
+            "This password reset link has expired. Please request a new one.",
+            "PASSWORD_RESET_EXPIRED"
+          );
+        }
+        throw Errors.unauthorized(
+          "This password reset link is invalid. Please request a new one.",
+          "PASSWORD_RESET_INVALID"
+        );
+      }
+
+      const user = await prisma.user.findUnique({ where: { id: payload.userId } });
+      if (!user || user.status !== "ACTIVE") {
+        throw Errors.unauthorized(
+          "This password reset link is invalid. Please request a new one.",
+          "PASSWORD_RESET_INVALID"
+        );
+      }
+
+      // Single-use enforcement: the token only matches if the password
+      // hasn't changed since it was issued (see passwordResetToken.ts) —
+      // this also means a token can't be replayed after a successful
+      // reset, since that reset itself changes the fingerprint.
+      if (passwordFingerprint(user.passwordHash) !== payload.pwFingerprint) {
+        throw Errors.unauthorized(
+          "This password reset link has already been used. Please request a new one.",
+          "PASSWORD_RESET_ALREADY_USED"
+        );
+      }
+
+      if (!isPasswordStrongEnough(body.password)) {
+        throw Errors.validation("Password must be at least 8 characters and include a letter and a number.");
+      }
+
+      const passwordHash = await hashPassword(body.password);
+      await prisma.user.update({ where: { id: user.id }, data: { passwordHash } });
+
+      // A password reset should immediately kill any already-issued
+      // sessions/JWTs for this account — same reasoning as suspending a
+      // cashier (see PATCH /admin/cashiers/:id/status).
+      await prisma.session.updateMany({
+        where: { userId: user.id, revokedAt: null },
+        data: { revokedAt: new Date() },
+      });
+
+      await recordAudit({
+        action: "PASSWORD_RESET_COMPLETED",
+        actorId: user.id,
+        actorRole: user.role,
+        shopId: user.shopId,
+        entityType: "User",
+        entityId: user.id,
+      });
+
+      return { success: true, data: null, message: "Your password has been reset. You can now log in." };
     }
   );
 

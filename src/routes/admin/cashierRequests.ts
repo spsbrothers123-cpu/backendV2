@@ -6,6 +6,7 @@ import { parseBody } from "../../lib/validate.js";
 import { recordAudit } from "../../lib/audit.js";
 import { sendCashierApproved, sendCashierRejected } from "../../lib/email.js";
 import { listShopsForAdmin, ensureAdminShopLink } from "../../lib/shopAccess.js";
+import { initializeCashierInventory } from "../../services/inventoryService.js";
 import type { AccountStatus, Prisma } from "@prisma/client";
 
 const listQuerySchema = z.object({
@@ -132,9 +133,19 @@ export default async function cashierRequestsRoutes(fastify: FastifyInstance) {
 
     const shopId = target.shopId;
 
-    const updated = await prisma.user.update({
-      where: { id: target.id },
-      data: { status: "ACTIVE", approvedAt: new Date(), approvedBy: admin.id },
+    // RBR Egg Mart V2 Phase 1 — New Cashier Initialization: approval is
+    // also the moment this cashier's fresh, zero-stock inventory is
+    // created — one CashierInventory row per product already in the
+    // shop's (global, shared) catalog. Wrapped in the same transaction as
+    // the status flip so a cashier is never left ACTIVE without it (or
+    // vice versa on a failure).
+    const { updated, productsInitialized } = await prisma.$transaction(async (tx) => {
+      const updatedUser = await tx.user.update({
+        where: { id: target.id },
+        data: { status: "ACTIVE", approvedAt: new Date(), approvedBy: admin.id },
+      });
+      const { productsInitialized: count } = await initializeCashierInventory(tx, shopId, updatedUser.id);
+      return { updated: updatedUser, productsInitialized: count };
     });
 
     // Approval is the moment the admin takes ownership of the cashier's
