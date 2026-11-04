@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 
 const db = vi.hoisted(() => ({
   product: { findMany: vi.fn() },
+  branchProduct: { findMany: vi.fn() },
   bill: { findMany: vi.fn(), groupBy: vi.fn() },
   purchase: { findMany: vi.fn() },
   expense: { findMany: vi.fn() },
@@ -27,10 +28,23 @@ const shops = [
 const period = resolveConsolidationPeriod({ range: "custom", dateFrom: "2026-10-01", dateTo: "2026-10-03" }, new Date("2026-10-17T00:00:00Z"), 330);
 const egg = (shopId: string, stock: number, extra = {}) => ({ shopId, name: "Egg", category: "Eggs", sku: null, barcode: "8901", unit: "TRAY", stock, id: `p-${shopId}`, lowStockThreshold: 20, ...extra });
 
-beforeEach(() => vi.clearAllMocks());
+// Mirrors BranchProduct: one assigned row per (shop, product). egg() ids are `p-${shopId}`.
+const assigned = (...shopIds: string[]) =>
+  db.branchProduct.findMany.mockResolvedValue(
+    shopIds.map((shopId) => ({ shopId, productId: `p-${shopId}`, isAssigned: true, priceOverride: null })),
+  );
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  // assignedBranchStock calls prisma.branchProduct.findMany; default to no branch rows.
+  // Tests that need branch rows can override with their own mockResolvedValue([...]),
+  // e.g. via the assigned(...shopIds) helper above.
+  db.branchProduct.findMany.mockResolvedValue([]);
+});
 
 describe("getProductStock", () => {
   it("sums per-shop stock exactly, keeps non-carrying shops null, and never uses date params", async () => {
+    assigned("s1", "s2", "s3");
     db.product.findMany.mockResolvedValue([
       egg("s1", 50), egg("s2", 60), egg("s3", 80),
       { ...egg("s1", 7), barcode: null, name: "Feed", category: "Supplies", unit: "KG" },
@@ -57,6 +71,7 @@ describe("getProductStock", () => {
 
 describe("getLowStock", () => {
   it("reuses the inventory-alert rules (<= threshold, 0 = Critical)", async () => {
+    assigned("s1", "s2", "s3");
     db.product.findMany.mockResolvedValue([egg("s1", 50), egg("s2", 4), egg("s3", 0)]);
     const r = await getLowStock(shops, { page: 1, pageSize: 20 });
     expect(r.rows.map((x) => [x.shopId, x.status, x.available, x.threshold])).toEqual([["s3", "Critical", 0, 20], ["s2", "Low Stock", 4, 20]]);

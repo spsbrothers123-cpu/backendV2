@@ -60,6 +60,10 @@ enum AuditAction {
   PRODUCT_CREATED
   PRODUCT_UPDATED
   PRODUCT_DELETED
+  PRODUCT_ASSIGNED
+  PRODUCT_UNASSIGNED
+  PRICE_OVERRIDE_SET
+  PRICE_OVERRIDE_CLEARED
   CUSTOMER_CREATED
   CUSTOMER_UPDATED
   BILL_CREATED
@@ -71,6 +75,8 @@ enum AuditAction {
   CREDIT_PAYMENT_CREATED
   INVENTORY_ADJUSTED
   PURCHASE_CREATED
+  PURCHASE_REVERSED
+  BILL_CANCELLED
   EXPENSE_CREATED
   EXPENSE_UPDATED
   EXPENSE_DELETED
@@ -80,6 +86,18 @@ enum AuditAction {
   // ── RBR Egg Mart V2 Phase 1 (this phase) ────────────────────────────
   PASSWORD_RESET_REQUESTED
   PASSWORD_RESET_COMPLETED
+
+  // ── UPI Management (Admin UPI configuration) ─────────────────────────
+  UPI_CONFIG_UPDATED
+
+  // ── Cashier admin-assisted password recovery ─────────────────────────
+  CASHIER_RECOVERY_REQUESTED
+  CASHIER_RECOVERY_APPROVED
+  CASHIER_RECOVERY_REJECTED
+  CASHIER_RECOVERY_COMPLETED
+  CASHIER_RECOVERY_FAILED
+  CASHIER_RECOVERY_THROTTLED
+  CASHIER_RECOVERY_DENIED
 }
 
 // ── Phase 2 enums ─────────────────────────────────────────────────────
@@ -120,6 +138,9 @@ enum PaymentMethod {
 enum CreditTxnType {
   CHARGE
   COLLECTION
+  // Phase 2 Stage 2.7: reverses the CHARGE rows of a cancelled bill. At most
+  // one per bill (partial unique index in the migration).
+  REVERSAL
 }
 
 enum StockMovementType {
@@ -170,6 +191,10 @@ model Shop {
   creditTxns       CreditTransaction[]
   inventoryMoves   InventoryMovement[]
   cashierInventories CashierInventory[]
+  // Phase 2 Stage 2.1: branch-level assignment + stock (additive; unused by
+  // application code until Stages 2.2 / 2.3).
+  branchProducts    BranchProduct[]
+  branchInventories BranchInventory[]
   purchases        Purchase[]
   expenses         Expense[]
   billCounters     BillCounter[]
@@ -180,6 +205,9 @@ model Shop {
   // Multi-shop foundation: which Admin(s) own/manage this shop. A row here
   // is the source of truth for shop access — see AdminShopLink below.
   adminLinks       AdminShopLink[]
+
+  // UPI Management: per-admin receiving-account settings for this shop.
+  upiShopAccounts  UpiShopAccount[]
 
   @@map("shops")
 }
@@ -356,8 +384,32 @@ model User {
   // into the table — see AdminShopLink's doc comment.
   shopLinks           AdminShopLink[]
 
+  // UPI Management (ADMIN only): the common receiving account and the
+  // per-shop settings this admin owns.
+  upiCommonAccount    UpiCommonAccount?
+  upiShopAccounts     UpiShopAccount[]
+
+  // Admin password recovery (Phase 1 foundation): recovery codes, the
+  // short-lived grants issued after a successful verification, and the
+  // recovery audit/throttle ledger. All keyed to THIS table's id — no
+  // parallel user/auth tables.
+  adminRecoveryCodes  AdminRecoveryCode[]
+  adminRecoveryGrants AdminRecoveryGrant[]
+  adminRecoveryAudits AdminRecoveryAudit[]
+
+  // Admin Security Settings (Phase 2): registered passkeys + the
+  // short-lived WebAuthn registration challenges.
+  adminPasskeys          AdminPasskey[]
+  adminPasskeyChallenges AdminPasskeyChallenge[]
+
+  // Cashier admin-assisted password recovery: requests filed BY this cashier,
+  // and requests decided (approved/rejected) BY this user (the Central Admin).
+  cashierRecoveryRequests         CashierRecoveryRequest[] @relation("CashierRecoveryRequester")
+  cashierRecoveryRequestsDecided  CashierRecoveryRequest[] @relation("CashierRecoveryDecider")
+
   cashierSessions     CashierSession[]
   billsAsCashier      Bill[]              @relation("CashierBills")
+  billsCancelled      Bill[]              @relation("BillCancelledBy")
   inventoryMoves      InventoryMovement[]
   inventoryMovesAsCashierOwner InventoryMovement[] @relation("InventoryMovementCashier")
   cashierInventories  CashierInventory[]  @relation("CashierInventoryOwner")
@@ -448,6 +500,8 @@ model Product {
   billItems         BillItem[]
   inventoryMoves    InventoryMovement[]
   cashierInventories CashierInventory[]
+  branchProducts    BranchProduct[]
+  branchInventories BranchInventory[]
   purchaseItems     PurchaseItem[]
 
   @@index([shopId, status])
@@ -492,6 +546,100 @@ model CashierInventory {
   @@index([shopId, cashierId])
   @@index([productId])
   @@map("cashier_inventories")
+}
+
+// ── Phase 2 Stage 2.1: Global catalog + branch inventory (ADDITIVE) ───────
+//
+// Target architecture: ONE Central Admin -> branches (Shop rows) -> exactly
+// ONE Cashier per branch. Product rows (existing IDs preserved) become the
+// global catalog; these two tables add per-branch assignment/price and
+// per-branch stock. Nothing in the application reads or writes them yet:
+//   * Stage 2.2 backfills/maintains BranchProduct and switches visibility.
+//   * Stage 2.3 backfills BranchInventory (verified, hard-stop on mismatch)
+//     and moves stock operations onto it after an authorized cutover.
+// Until then CashierInventory stays the live stock source and
+// Product.stock stays the maintained aggregate. Product.shopId remains as
+// legacy origin-shop metadata.
+
+// Which products a branch carries, plus an optional branch price override.
+// A row with isAssigned = false means "hidden from this branch" — it never
+// deletes stock or history (stock lives in BranchInventory and is untouched
+// by (un)assignment). "No row" is a state Stage 2.2 closes by backfilling a
+// row for every shop/product pair; inactive products stay a separate
+// concept (Product.status), distinct from unassigned.
+model BranchProduct {
+  id            String    @id @default(uuid())
+  shopId        String
+  shop          Shop      @relation(fields: [shopId], references: [id])
+  productId     String
+  product       Product   @relation(fields: [productId], references: [id])
+
+  isAssigned    Boolean   @default(true)
+
+  // Optional. Effective price = priceOverride ?? Product.sellingPrice
+  // (Stage 2.5). NUMERIC, never float — see lib/money.ts.
+  priceOverride Decimal?  @db.Decimal(12, 2)
+
+  // Assignment metadata. Actor ids are plain nullable references kept as
+  // audit metadata (no FK) so an account change can never block or cascade
+  // into assignment history.
+  assignedAt    DateTime  @default(now())
+  assignedById  String?
+  unassignedAt  DateTime?
+  unassignedById String?
+
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  @@unique([shopId, productId])
+  @@index([shopId, isAssigned])
+  @@index([productId])
+  @@map("branch_products")
+}
+
+// Authoritative per-branch stock after the approved cutover (Stage 2.3).
+// One row per (branch, product). Product.stock is then the SUM of these
+// rows, maintained in the same transaction. quantity can never go negative
+// (CHECK constraint added in the migration; Prisma cannot express it).
+model BranchInventory {
+  id        String   @id @default(uuid())
+  shopId    String
+  shop      Shop     @relation(fields: [shopId], references: [id])
+  productId String
+  product   Product  @relation(fields: [productId], references: [id])
+
+  quantity  Int      @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([shopId, productId])
+  @@index([productId])
+  @@map("branch_inventories")
+}
+
+// ── Phase 2 Stage 2.3: runtime switches ───────────────────────────────────
+//
+// Tiny key/value table for deliberate, DB-level switches that application
+// code reads inside the same transaction that uses them.
+//
+// key = "inventory_source": which table is the AUTHORITATIVE stock source.
+//   "CASHIER" (default) — legacy: CashierInventory is the source (Stages
+//                         <= 2.2 behaviour, unchanged).
+//   "BRANCH"            — BranchInventory is the source; CashierInventory
+//                         receives no new writes. Flipped ONLY by the
+//                         authorized cutover script (prisma/prepared/
+//                         03_inventory_cutover.sql), atomically with the
+//                         verified backfill — never by application code.
+// Every stock-changing transaction takes a shared row lock on this row;
+// the cutover takes it exclusively, so the switch can never interleave
+// with an in-flight sale, purchase or adjustment.
+model SystemFlag {
+  key       String   @id
+  value     String
+  updatedAt DateTime @default(now()) @updatedAt
+
+  @@map("system_flags")
 }
 
 model Customer {
@@ -602,6 +750,14 @@ model Bill {
   heldAt         DateTime?
   paidAt         DateTime?
   cancelledAt    DateTime?
+
+  // Phase 2 Stage 2.7 — cancellation record (the bill itself is never
+  // deleted or rewritten; status flips PAID -> CANCELLED exactly once).
+  cancelledById  String?
+  cancelledBy    User?          @relation("BillCancelledBy", fields: [cancelledById], references: [id])
+  cancelReason   String?
+  // True when the bill belonged to an already-CLOSED cashier session.
+  cancelledAfterSessionClose Boolean @default(false)
 
   items          BillItem[]
   payments       Payment[]
@@ -735,8 +891,30 @@ model Purchase {
 
   items         PurchaseItem[]
 
+  // Stage 2.6: `shopId` above IS the explicitly selected RECEIVING branch
+  // (stock went only there). It is immutable after creation — enforced by a
+  // DB trigger. Corrections are made with a linked reversal, never by
+  // editing the branch. At most one reversal per purchase (unique).
+  reversal      PurchaseReversal?
+
   @@index([shopId, createdAt])
   @@map("purchases")
+}
+
+// Stage 2.6: linked reversal record for a completed purchase. The original
+// purchase and its items are never modified or deleted. Creating this row
+// and the negative stock movements happens in ONE transaction; the unique
+// purchaseId makes a double (or concurrent) reversal impossible.
+model PurchaseReversal {
+  id           String   @id @default(uuid())
+  purchaseId   String   @unique
+  purchase     Purchase @relation(fields: [purchaseId], references: [id])
+  reason       String
+  // Plain audit metadata (no FK), same pattern as BranchProduct.assignedById.
+  reversedById String?
+  createdAt    DateTime @default(now())
+
+  @@map("purchase_reversals")
 }
 
 model PurchaseItem {
@@ -787,4 +965,306 @@ model Expense {
 
   @@index([shopId, date])
   @@map("expenses")
+}
+
+// ── UPI Management ───────────────────────────────────────────────────────
+// Where a shop's customers' UPI payments are received. Configuration only —
+// no payment, bill or reference data lives here, and nothing in these
+// tables ever marks a payment as received or verified.
+
+enum UpiAccountMode {
+  COMMON
+  CUSTOM
+}
+
+/// One common receiving account per Admin; the fallback for every shop that
+/// Admin is authorized for.
+model UpiCommonAccount {
+  id        String   @id @default(uuid())
+  adminId   String   @unique
+  admin     User     @relation(fields: [adminId], references: [id], onDelete: Cascade)
+
+  /// Stored trimmed + lower-cased (UPI IDs are compared case-insensitively).
+  upiId     String
+  payeeName String
+  enabled   Boolean  @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("upi_common_accounts")
+}
+
+/// Per (Admin, shop) settings. Keyed by BOTH because a shop can be linked
+/// to several Admins (AdminShopLink is many-to-many) and one Admin's
+/// settings must never overwrite or reveal another's.
+model UpiShopAccount {
+  id        String         @id @default(uuid())
+  adminId   String
+  admin     User           @relation(fields: [adminId], references: [id], onDelete: Cascade)
+  shopId    String
+  shop      Shop           @relation(fields: [shopId], references: [id], onDelete: Cascade)
+
+  mode      UpiAccountMode @default(COMMON)
+
+  /// Custom account details. Retained (dormant) while mode = COMMON and
+  /// never used for resolution in that mode.
+  customUpiId     String?
+  customPayeeName String?
+  customEnabled   Boolean  @default(false)
+
+  createdAt DateTime       @default(now())
+  updatedAt DateTime       @updatedAt
+
+  @@unique([adminId, shopId])
+  @@index([shopId])
+  @@map("upi_shop_accounts")
+}
+
+// ── Admin password recovery (Phase 1 foundation) ───────────────────────
+// Recovery codes only for now; passkeys are intentionally NOT modelled yet
+// (they wait on the production-domain decision). All three tables are
+// server-only: the migration enables RLS with no policies and revokes the
+// Supabase `anon` / `authenticated` roles, so nothing here is reachable
+// through the Supabase Data API — only through this backend.
+
+enum AdminRecoveryMethod {
+  RECOVERY_CODE
+  PASSKEY
+}
+
+enum AdminRecoveryEvent {
+  CODES_GENERATED
+  CODES_REGENERATED
+  CODE_VERIFICATION
+  GRANT_ISSUED
+  GRANT_CONSUMED
+  ATTEMPT_THROTTLED
+  // Phase 2 — Admin Security Settings
+  REAUTH_FAILED
+  PASSKEY_REGISTERED
+  PASSKEY_REGISTRATION_FAILED
+  PASSKEY_REMOVED
+  // Phase 3 — Forgot Password flow
+  PASSKEY_VERIFICATION
+  PASSWORD_RECOVERED
+  // Phase 5 — operator-performed ownership recovery (docs/ADMIN_OWNERSHIP_RECOVERY.md)
+  MANUAL_OWNERSHIP_RECOVERY
+}
+
+enum AdminRecoveryOutcome {
+  SUCCESS
+  FAILURE
+}
+
+/// One row per emergency recovery code. Only a keyed hash (HMAC-SHA256,
+/// see lib/recoveryCodes.ts) is stored — never the raw code. A code is
+/// usable while usedAt and revokedAt are both null.
+model AdminRecoveryCode {
+  id     String @id @default(uuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  /// Groups the 8 codes created together; regeneration revokes the whole
+  /// previous set.
+  setId    String
+  codeHash String
+
+  usedAt    DateTime?
+  revokedAt DateTime?
+  createdAt DateTime  @default(now())
+
+  @@unique([userId, codeHash])
+  @@index([userId, setId])
+  @@map("admin_recovery_codes")
+}
+
+/// Short-lived, single-purpose authorization issued after a recovery
+/// credential has been verified. Opaque random token — only its SHA-256 is
+/// stored. Consumed atomically (consumedAt) so it can never be replayed.
+model AdminRecoveryGrant {
+  id     String @id @default(uuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  method    AdminRecoveryMethod
+  tokenHash String              @unique
+  /// SHA-256 of the User-Agent the grant was issued to; a different client
+  /// cannot redeem it (recovery-session hijack mitigation).
+  userAgentHash String
+  expiresAt     DateTime
+  consumedAt    DateTime?
+  createdAt     DateTime            @default(now())
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("admin_recovery_grants")
+}
+
+/// Append-only recovery audit trail AND the durable throttle ledger
+/// (CODE_VERIFICATION + FAILURE rows are what lib/recoveryThrottle.ts
+/// counts). userId is nullable: attempts against unknown emails must be
+/// recordable without revealing anything — those rows are keyed by
+/// subjectHash (a keyed hash of the email; the raw email is never stored
+/// here). Never put codes, tokens or passwords in metadata.
+model AdminRecoveryAudit {
+  id     String  @id @default(uuid())
+  userId String?
+  user   User?   @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  subjectHash String?
+  event       AdminRecoveryEvent
+  outcome     AdminRecoveryOutcome
+  method      AdminRecoveryMethod?
+
+  ip        String?
+  userAgent String?
+  metadata  Json?
+  createdAt DateTime @default(now())
+
+  @@index([subjectHash, createdAt])
+  @@index([ip, createdAt])
+  @@index([userId, createdAt])
+  @@map("admin_recovery_audit")
+}
+
+// ── Admin Security Settings (Phase 2): passkeys ────────────────────────
+// Same lock-down as the Phase 1 tables (RLS, no policies, anon/authenticated
+// revoked): reachable only through this backend.
+
+enum AdminPasskeyChallengePurpose {
+  REGISTRATION
+}
+
+/// One row per registered WebAuthn credential. Holds the PUBLIC key only —
+/// private keys and biometric data never leave the authenticator.
+model AdminPasskey {
+  id     String @id @default(uuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  /// base64url credential ID, globally unique (a credential can belong to
+  /// exactly one account).
+  credentialId String @unique
+  publicKey    Bytes
+  /// Signature counter (WebAuthn uint32 → BIGINT), advanced on every successful assertion.
+  counter      BigInt @default(0)
+  transports   String[]
+  /// "singleDevice" | "multiDevice"
+  deviceType   String
+  backedUp     Boolean
+
+  /// WebAuthn user handle (opaque random, not PII). Identical for every
+  /// passkey of one account.
+  userHandle String
+  /// Admin-chosen label, e.g. "Shop laptop (Windows Hello)".
+  name       String
+
+  createdAt  DateTime  @default(now())
+  lastUsedAt DateTime?
+
+  @@index([userId])
+  @@map("admin_passkeys")
+}
+
+/// A registration challenge issued to an authenticated Admin. Single-use
+/// (consumedAt is set atomically) and short-lived.
+model AdminPasskeyChallenge {
+  id     String @id @default(uuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  purpose    AdminPasskeyChallengePurpose
+  challenge  String
+  /// The user handle that will be stored if this registration succeeds.
+  userHandle String
+  expiresAt  DateTime
+  consumedAt DateTime?
+  createdAt  DateTime @default(now())
+
+  @@index([userId, purpose])
+  @@index([expiresAt])
+  @@map("admin_passkey_challenges")
+}
+
+// ── Admin password recovery (Phase 3): unauthenticated passkey ceremony ─
+// Same lock-down as the other recovery tables (RLS, no policies, anon /
+// authenticated revoked). Deliberately has NO foreign key to users: a
+// challenge is issued for ANY submitted email (known or not) so the
+// response never reveals whether an Admin account exists. It is bound to
+// the keyed hash of that email and to the requesting User-Agent.
+
+/// A WebAuthn authentication challenge issued during Forgot Password.
+/// Single-use (consumedAt is set atomically) and short-lived.
+model AdminRecoveryChallenge {
+  id            String    @id @default(uuid())
+  /// hashRecoverySubject(email) — never the raw email.
+  subjectHash   String
+  /// SHA-256 of the User-Agent the challenge was issued to.
+  userAgentHash String
+  challenge     String
+  expiresAt     DateTime
+  consumedAt    DateTime?
+  createdAt     DateTime  @default(now())
+
+  @@index([subjectHash])
+  @@index([expiresAt])
+  @@map("admin_recovery_challenges")
+}
+
+// ── Cashier admin-assisted password recovery ───────────────────────────
+// One row per recovery request. NO email OTP / reset link is involved: the
+// Cashier files a request, the Central Admin verifies them IN PERSON, and the
+// backend then issues a one-time recovery code that is shown only to that
+// Admin and handed over directly.
+//
+// - expiresAt is fixed at createdAt + 15 minutes (enforced by a CHECK
+//   constraint in the migration) and is never moved by approval.
+// - Only a keyed hash of the code is stored (HMAC-SHA256, lib/cashierRecovery.ts);
+//   it is cleared as soon as the request leaves APPROVED.
+// - The migration also adds a PARTIAL UNIQUE INDEX
+//   (userId) WHERE status IN ('PENDING','APPROVED') — at most one active
+//   request per cashier. Prisma cannot model partial indexes, so it lives in
+//   SQL only; do not delete it when squashing migrations.
+// - Server-only table: RLS on, no policies, anon/authenticated revoked.
+
+enum CashierRecoveryStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  EXPIRED
+  COMPLETED
+}
+
+model CashierRecoveryRequest {
+  id     String @id @default(uuid())
+  userId String
+  user   User   @relation("CashierRecoveryRequester", fields: [userId], references: [id], onDelete: Cascade)
+
+  status CashierRecoveryStatus @default(PENDING)
+
+  createdAt  DateTime  @default(now())
+  expiresAt  DateTime
+  approvedAt DateTime?
+  rejectedAt DateTime?
+
+  decidedById String?
+  decidedBy   User?   @relation("CashierRecoveryDecider", fields: [decidedById], references: [id], onDelete: SetNull)
+
+  /// HMAC-SHA256 hex. Non-null only while status = APPROVED.
+  codeHash       String?
+  /// Wrong codes tried against this request (observability only — brute force is
+  /// stopped by the durable per-account/per-IP throttle, and a hard lockout here
+  /// would let a stranger burn an Admin-approved code).
+  failedAttempts Int       @default(0)
+  consumedAt     DateTime?
+  completedAt    DateTime?
+
+  ip        String?
+  userAgent String?
+
+  @@index([userId, createdAt])
+  @@index([status, expiresAt])
+  @@index([ip, createdAt])
+  @@map("cashier_recovery_requests")
 }

@@ -44,7 +44,12 @@ beforeEach(async () => {
   });
   productId = product.id;
 
-  const customer = await prisma.customer.create({ data: { shopId, name: "Test Customer", phone: "9990001111" } });
+  // Stock is per-cashier now (cashier_inventories); products.stock is only the
+  // denormalized shop-wide sum. Seed this cashier's own row to match.
+  await prisma.cashierInventory.create({ data: { shopId, cashierId, productId, quantity: 10 } });
+
+  // Billing only accepts a customer owned by the billing cashier (Phase 3).
+  const customer = await prisma.customer.create({ data: { shopId, cashierId, name: "Test Customer", phone: "9990001111" } });
   customerId = customer.id;
 
   await prisma.cashierSession.create({ data: { cashierId, shopId, openingCash: 1000 } });

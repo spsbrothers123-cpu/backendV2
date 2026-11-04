@@ -14,6 +14,11 @@ dotenv.config({ path: path.resolve(__dirname, "../.env") });
 process.env.NODE_ENV ??= "test";
 process.env.DATABASE_URL ??= "postgresql://user:password@localhost:5432/eggmart_test?schema=public";
 process.env.JWT_SECRET ??= "test-only-secret-do-not-use-in-production";
+// Admin recovery: test-only pepper (>= 32 chars). Never reuse outside tests.
+process.env.RECOVERY_CODE_PEPPER ??= "test-only-recovery-pepper-0123456789abcdef";
+// Passkeys: localhost relying party for tests (http is allowed for localhost only).
+process.env.WEBAUTHN_RP_ID ??= "localhost";
+process.env.WEBAUTHN_ORIGINS ??= "http://localhost:5173";
 
 // Safety net for integration runs: resetDb() wipes tables, so refuse to start
 // unless DATABASE_URL clearly points at a disposable *local* "test" database.

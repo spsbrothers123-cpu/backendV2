@@ -15,6 +15,7 @@ import type { FastifyInstance } from "fastify";
 import { buildApp } from "../src/app.js";
 import { prisma } from "../src/lib/prisma.js";
 import { resetDb } from "./dbReset.js";
+import { createAdminFixture } from "./adminFixture.js";
 
 let app: FastifyInstance;
 
@@ -32,146 +33,117 @@ beforeEach(async () => {
   await resetDb();
 });
 
+/** Provisions an Admin + shop like an operator would (see adminFixture.ts); returns a response-shaped object. */
 async function adminSignup(payload: {
   name?: string;
   email: string;
   password: string;
   shopLocation: string;
 }) {
-  const res = await app.inject({
-    method: "POST",
-    url: "/api/auth/admin/signup",
-    payload: { name: payload.name ?? "Admin", ...payload },
-  });
-  if (res.statusCode >= 400) {
-    throw new Error(`adminSignup failed (${res.statusCode}): ${res.payload}`);
-  }
-  return res;
+  const body = await createAdminFixture(app, payload);
+  return { statusCode: 201, payload: JSON.stringify(body) };
 }
 
-describe("Admin signup — multi-shop foundation", () => {
-  it("creates a new admin and a new shop named 'RBR Egg Mart - <Location>'", async () => {
-    const res = await adminSignup({
-      email: "owner@rbr.test",
+function signupAs(token: string | null, payload: Record<string, unknown>) {
+  return app.inject({
+    method: "POST",
+    url: "/api/auth/admin/signup",
+    headers: token ? { authorization: `Bearer ${token}` } : {},
+    payload,
+  });
+}
+
+describe("Admin signup — gated (security regression)", () => {
+  it("REFUSES unauthenticated requests — anyone could previously mint an ADMIN and join an existing shop", async () => {
+    const owner = await adminSignup({ email: "owner@rbr.test", password: "Password123", shopLocation: "Veerapandi" });
+    const shopId = JSON.parse(owner.payload).shop.id;
+    const usersBefore = await prisma.user.count();
+
+    const res = await signupAs(null, {
+      name: "Intruder",
+      email: "intruder@evil.test",
       password: "Password123",
       shopLocation: "Veerapandi",
-    });
-    expect(res.statusCode).toBe(201);
-    const body = JSON.parse(res.payload);
-    expect(body.token).toBeTruthy();
-    expect(body.shop.name).toBe("RBR Egg Mart - Veerapandi");
-    expect(body.shop.location).toBe("Veerapandi");
-
-    const shopsInDb = await prisma.shop.count();
-    expect(shopsInDb).toBe(1);
-  });
-
-  it("does not create a duplicate shop for the same location typed differently", async () => {
-    const first = await adminSignup({
-      email: "owner1@rbr.test",
-      password: "Password123",
-      shopLocation: "Veerapandi",
-    });
-    const second = await adminSignup({
-      email: "owner2@rbr.test",
-      password: "Password123",
-      shopLocation: "  veerapandi  ",
-    });
-
-    expect(first.statusCode).toBe(201);
-    expect(second.statusCode).toBe(201);
-    expect(JSON.parse(first.payload).shop.id).toBe(JSON.parse(second.payload).shop.id);
-
-    const shopsInDb = await prisma.shop.count();
-    expect(shopsInDb).toBe(1);
-  });
-
-  it("lets an existing admin add a second shop under the same account", async () => {
-    const first = await adminSignup({
-      email: "owner@rbr.test",
-      password: "Password123",
-      shopLocation: "Veerapandi",
-    });
-    const firstBody = JSON.parse(first.payload);
-
-    const second = await adminSignup({
-      email: "owner@rbr.test",
-      password: "Password123",
-      shopLocation: "Gandhipuram",
-    });
-    expect(second.statusCode).toBe(200); // not 201 — no new account created
-    const secondBody = JSON.parse(second.payload);
-    expect(secondBody.user.id).toBe(firstBody.user.id);
-    expect(secondBody.shop.name).toBe("RBR Egg Mart - Gandhipuram");
-
-    const usersInDb = await prisma.user.count();
-    expect(usersInDb).toBe(1); // still one admin account, not two
-
-    const shopsRes = await app.inject({
-      method: "GET",
-      url: "/api/admin/shops",
-      headers: { authorization: `Bearer ${secondBody.token}` },
-    });
-    const shops = JSON.parse(shopsRes.payload).data;
-    expect(shops).toHaveLength(2);
-    expect(shops.map((s: { location: string }) => s.location).sort()).toEqual(["Gandhipuram", "Veerapandi"]);
-  });
-
-  it("rejects adding a shop to an existing admin email with the wrong password", async () => {
-    await adminSignup({ email: "owner@rbr.test", password: "Password123", shopLocation: "Veerapandi" });
-
-    // Deliberately NOT using the adminSignup() helper here — it throws on
-    // any statusCode >= 400, but this call is expected to fail (401), so
-    // we need the raw response to assert against.
-    const res = await app.inject({
-      method: "POST",
-      url: "/api/auth/admin/signup",
-      payload: {
-        name: "Admin",
-        email: "owner@rbr.test",
-        password: "WrongPassword1",
-        shopLocation: "Gandhipuram",
-      },
     });
     expect(res.statusCode).toBe(401);
-    expect(JSON.parse(res.payload).code).toBe("INVALID_CREDENTIALS");
-
-    const shopsInDb = await prisma.shop.count();
-    expect(shopsInDb).toBe(1); // no shop created off the failed attempt
+    expect(await prisma.user.count()).toBe(usersBefore);
+    expect(await prisma.user.findUnique({ where: { email: "intruder@evil.test" } })).toBeNull();
+    expect(await prisma.adminShopLink.count({ where: { shopId } })).toBe(1);
   });
 
-  it("rejects admin signup on an email already used by a cashier", async () => {
-    const ownerRes = await adminSignup({
-      email: "owner@rbr.test",
-      password: "Password123",
-      shopLocation: "Veerapandi",
-    });
-    const shopId = JSON.parse(ownerRes.payload).shop.id;
+  it("refuses a Cashier token", async () => {
+    const owner = JSON.parse((await adminSignup({ email: "owner@rbr.test", password: "Password123", shopLocation: "Veerapandi" })).payload);
     await prisma.user.create({
-      data: {
-        name: "Cashier",
-        email: "cashier@rbr.test",
-        passwordHash: "irrelevant",
-        role: "CASHIER",
-        status: "ACTIVE",
-        shopId,
-      },
+      data: { name: "C", email: "c@rbr.test", passwordHash: await (await import("../src/lib/password.js")).hashPassword("Password123"), role: "CASHIER", status: "ACTIVE", shopId: owner.shop.id },
     });
+    const login = await app.inject({ method: "POST", url: "/api/auth/login", payload: { email: "c@rbr.test", password: "Password123" } });
+    const res = await signupAs(JSON.parse(login.payload).token, {
+      name: "x", email: "c@rbr.test", password: "Password123", shopLocation: "Gandhipuram",
+    });
+    expect(res.statusCode).toBe(403);
+  });
 
-    // Same deal — this call is expected to fail (409), so it can't go
-    // through the throwing adminSignup() helper.
-    const res = await app.inject({
-      method: "POST",
-      url: "/api/auth/admin/signup",
-      payload: {
-        name: "Admin",
-        email: "cashier@rbr.test",
-        password: "Password123",
-        shopLocation: "Singanallur",
-      },
+  it("cannot create a NEW admin account even when authenticated as an admin", async () => {
+    const owner = JSON.parse((await adminSignup({ email: "owner@rbr.test", password: "Password123", shopLocation: "Veerapandi" })).payload);
+    const res = await signupAs(owner.token, {
+      name: "Second", email: "second@rbr.test", password: "Password123", shopLocation: "Gandhipuram",
     });
-    expect(res.statusCode).toBe(409);
-    expect(JSON.parse(res.payload).code).toBe("ACCOUNT_ALREADY_EXISTS");
+    expect(res.statusCode).toBe(403);
+    expect(JSON.parse(res.payload).code).toBe("ADMIN_CREATION_DISABLED");
+    expect(await prisma.user.count({ where: { role: "ADMIN" } })).toBe(1);
+  });
+
+  it("lets an authenticated admin add a NEW shop to their own account (existing legitimate use)", async () => {
+    const owner = JSON.parse((await adminSignup({ email: "owner@rbr.test", password: "Password123", shopLocation: "Veerapandi" })).payload);
+    const res = await signupAs(owner.token, {
+      name: "Admin", email: "owner@rbr.test", password: "Password123", shopLocation: "Gandhipuram",
+    });
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.payload);
+    expect(body.user.id).toBe(owner.user.id);
+    expect(body.shop.name).toBe("RBR Egg Mart - Gandhipuram");
+    expect(await prisma.user.count()).toBe(1);
+
+    const shopsRes = await app.inject({ method: "GET", url: "/api/admin/shops", headers: { authorization: `Bearer ${owner.token}` } });
+    const shops = JSON.parse(shopsRes.payload).data;
+    expect(shops.map((x: { location: string }) => x.location).sort()).toEqual(["Gandhipuram", "Veerapandi"]);
+  });
+
+  it("is idempotent for a shop the admin already owns and dedupes the location typed differently", async () => {
+    const owner = JSON.parse((await adminSignup({ email: "owner@rbr.test", password: "Password123", shopLocation: "Veerapandi" })).payload);
+    const res = await signupAs(owner.token, {
+      name: "Admin", email: "owner@rbr.test", password: "Password123", shopLocation: "  veerapandi ",
+    });
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.payload).shop.id).toBe(owner.shop.id);
+    expect(await prisma.shop.count()).toBe(1);
+  });
+
+  it("will NOT link an admin to a shop another admin already manages", async () => {
+    const a = JSON.parse((await adminSignup({ email: "a@rbr.test", password: "Password123", shopLocation: "Veerapandi" })).payload);
+    const b = JSON.parse((await adminSignup({ email: "b@rbr.test", password: "Password123", shopLocation: "Gandhipuram" })).payload);
+    const res = await signupAs(b.token, {
+      name: "B", email: "b@rbr.test", password: "Password123", shopLocation: "Veerapandi",
+    });
+    expect(res.statusCode).toBe(403);
+    expect(JSON.parse(res.payload).code).toBe("SHOP_OWNED_BY_ANOTHER_ADMIN");
+    expect(await prisma.adminShopLink.count({ where: { shopId: a.shop.id } })).toBe(1);
+  });
+
+  it("requires the caller's current password (wrong password adds nothing)", async () => {
+    const owner = JSON.parse((await adminSignup({ email: "owner@rbr.test", password: "Password123", shopLocation: "Veerapandi" })).payload);
+    const res = await signupAs(owner.token, {
+      name: "Admin", email: "owner@rbr.test", password: "WrongPassword1", shopLocation: "Gandhipuram",
+    });
+    expect(res.statusCode).toBe(403);
+    expect(await prisma.shop.count()).toBe(1);
+  });
+
+  it("existing admin login is unaffected", async () => {
+    await adminSignup({ email: "owner@rbr.test", password: "Password123", shopLocation: "Veerapandi" });
+    const res = await app.inject({ method: "POST", url: "/api/auth/admin/login", payload: { email: "owner@rbr.test", password: "Password123" } });
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.payload).token).toBeTruthy();
   });
 });
 

@@ -198,6 +198,23 @@ All require `Authorization: Bearer <admin token>`; scoped to the admin's own sho
 | PATCH | `/admin/cashiers/:id` | Body: `{ name?, phone? }` |
 | PATCH | `/admin/cashiers/:id/status` | Body: `{ status: "ACTIVE" \| "SUSPENDED" }` — suspending revokes all live sessions |
 
+### Admin — security settings (account recovery)
+
+All routes are ADMIN-only and every sensitive action requires the Admin's **current password in the request body** (verified server-side; wrong attempts are throttled per account). Responses are `Cache-Control: no-store`.
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| GET | `/api/admin/security/status` | Recovery-code count, passkey list, `noRecoveryMethodConfigured` flag |
+| POST | `/api/admin/security/recovery-codes` | Generate (or regenerate, revoking the old set) 8 one-time codes. Raw codes appear in this response only |
+| POST | `/api/admin/security/passkeys/register/options` | Start passkey registration (returns WebAuthn options + `challengeId`) |
+| POST | `/api/admin/security/passkeys/register/verify` | Finish registration (verifies the authenticator response, stores the public key) |
+| POST | `/api/admin/security/passkeys/:id/remove` | Remove one of your own passkeys |
+
+Required/optional environment for these features:
+
+- `RECOVERY_CODE_PEPPER` (>= 32 chars, required for recovery codes; rotating it invalidates all stored codes).
+- `WEBAUTHN_RP_ID`, `WEBAUTHN_ORIGINS` (comma-separated), optional `WEBAUTHN_RP_NAME`. **No defaults on purpose** — a passkey is bound to its RP ID permanently, so choose it deliberately (e.g. `eggmart.example.com`; origins must be `https`, or `http://localhost…` in dev, and on the RP ID or a subdomain). Until both are set, passkey endpoints return `503 PASSKEYS_NOT_CONFIGURED` and recovery codes keep working.
+
 ### Health
 
 | Method | Path | Notes |

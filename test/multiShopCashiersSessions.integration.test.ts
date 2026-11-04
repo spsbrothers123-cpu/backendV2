@@ -18,6 +18,7 @@ import { prisma } from "../src/lib/prisma.js";
 import { hashPassword } from "../src/lib/password.js";
 import { checkoutBill } from "../src/services/billingService.js";
 import { resetDb } from "./dbReset.js";
+import { createAdminFixture } from "./adminFixture.js";
 
 let app: FastifyInstance;
 
@@ -38,15 +39,7 @@ beforeEach(async () => {
 // ── Shared fixture helpers ──────────────────────────────────────────────
 
 async function adminSignup(payload: { name?: string; email: string; password: string; shopLocation: string }) {
-  const res = await app.inject({
-    method: "POST",
-    url: "/api/auth/admin/signup",
-    payload: { name: payload.name ?? "Admin", ...payload },
-  });
-  if (res.statusCode >= 400) {
-    throw new Error(`adminSignup failed (${res.statusCode}): ${res.payload}`);
-  }
-  return JSON.parse(res.payload) as { token: string; user: { id: string }; shop: { id: string; name: string; location: string } };
+  return (await createAdminFixture(app, payload)) as { token: string; user: { id: string }; shop: { id: string; name: string; location: string } };
 }
 
 async function switchShop(token: string, shopId: string) {
@@ -355,16 +348,20 @@ describe("Cashier shop isolation (spec §3–6): shopId is always server-derived
     const arunSession = await prisma.cashierSession.create({
       data: { cashierId: (await prisma.user.findUniqueOrThrow({ where: { email: "arun@rbr.test" } })).id, shopId: veerapandi.id, openingCash: 1000 },
     });
+    // Stock is per-cashier: give Arun his own inventory row for his shop's product.
+    await prisma.cashierInventory.create({
+      data: { shopId: veerapandi.id, cashierId: arunSession.cashierId, productId: veerapandiProduct.id, quantity: 10 },
+    });
 
     // Arun (Veerapandi) can bill his own shop's product.
-    const bill = await checkoutBill({
+    const bill = (await checkoutBill({
       shopId: veerapandi.id,
       cashierId: arunSession.cashierId,
       customerId: null,
       items: [{ productId: veerapandiProduct.id, quantity: 1 }],
       payments: [{ method: "cash", amount: 100 }],
       idempotencyKey: null,
-    });
+    })) as { id: string };
     const savedBill = await prisma.bill.findUnique({ where: { id: bill.id } });
     expect(savedBill?.shopId).toBe(veerapandi.id);
 

@@ -24,6 +24,7 @@ import type { FastifyInstance } from "fastify";
 import { buildApp } from "../src/app.js";
 import { prisma } from "../src/lib/prisma.js";
 import { resetDb } from "./dbReset.js";
+import { createAdminFixture } from "./adminFixture.js";
 
 let app: FastifyInstance;
 
@@ -46,13 +47,7 @@ beforeEach(async () => {
 type ShopInfo = { id: string; name: string; location: string };
 
 async function adminSignup(email: string, shopLocation: string) {
-  const res = await app.inject({
-    method: "POST",
-    url: "/api/auth/admin/signup",
-    payload: { name: "Admin", email, password: "Password123", shopLocation },
-  });
-  if (res.statusCode >= 400) throw new Error(`adminSignup failed: ${res.payload}`);
-  return JSON.parse(res.payload) as { token: string; shop: ShopInfo };
+  return (await createAdminFixture(app, { email, shopLocation })) as { token: string; shop: ShopInfo };
 }
 
 /** One admin owning two shops. After this, the admin's ACTIVE shop is Veerapandi

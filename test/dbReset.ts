@@ -37,6 +37,9 @@ export async function resetDb() {
     prisma.payment.deleteMany(),
     prisma.creditTransaction.deleteMany(),
     prisma.purchaseItem.deleteMany(),
+    // PurchaseReversal.purchaseId -> Purchase has no onDelete, so it must
+    // go before purchase.
+    prisma.purchaseReversal.deleteMany(),
     prisma.purchase.deleteMany(),
     prisma.inventoryMovement.deleteMany(),
 
@@ -51,6 +54,12 @@ export async function resetDb() {
     // CashierInventory has FKs to product, cashier (User), and shop —
     // must go before all three of their deleteMany() calls.
     prisma.cashierInventory.deleteMany(),
+
+    // Phase 2 branch tables: FKs to product and shop, no onDelete (RESTRICT),
+    // so they must go before product and shop.
+    prisma.branchInventory.deleteMany(),
+    prisma.branchProduct.deleteMany(),
+
     prisma.product.deleteMany(),
     prisma.customer.deleteMany(),
     prisma.shopSettings.deleteMany(),
@@ -60,6 +69,18 @@ export async function resetDb() {
     prisma.adminShopLink.deleteMany(),
     prisma.invitationCode.deleteMany(),
     prisma.auditLog.deleteMany(),
+    // Admin recovery (FKs to user; cleared before it).
+    // Cashier admin-assisted recovery requests (FK to user).
+    prisma.cashierRecoveryRequest.deleteMany(),
+    prisma.adminRecoveryGrant.deleteMany(),
+    prisma.adminRecoveryCode.deleteMany(),
+    prisma.adminRecoveryAudit.deleteMany(),
+    prisma.adminPasskeyChallenge.deleteMany(),
+    prisma.adminRecoveryChallenge.deleteMany(),
+    prisma.adminPasskey.deleteMany(),
+    // UPI Management config (FKs to user/shop; cleared before both).
+    prisma.upiShopAccount.deleteMany(),
+    prisma.upiCommonAccount.deleteMany(),
 
     // User before shop: User.shopId references Shop.
     prisma.user.deleteMany(),
