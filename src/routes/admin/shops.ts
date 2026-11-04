@@ -3,8 +3,13 @@ import { z } from "zod";
 import { prisma } from "../../lib/prisma.js";
 import { parseBody } from "../../lib/validate.js";
 import { recordAudit } from "../../lib/audit.js";
-import { assertAdminOwnsShop, listShopsForAdmin } from "../../lib/shopAccess.js";
+import { assertAdminOwnsShop, createBranch, ensureAdminShopLink, listShopsForAdmin } from "../../lib/shopAccess.js";
+import { centralAdminOnly } from "../../lib/centralAdmin.js";
 import type { Shop } from "@prisma/client";
+
+const createBranchSchema = z.object({
+  location: z.string().trim().min(1, "Branch location is required.").max(120),
+});
 
 const switchShopSchema = z.object({
   shopId: z.string().trim().min(1, "shopId is required."),
@@ -37,6 +42,28 @@ export default async function adminShopsRoutes(fastify: FastifyInstance) {
       data: shops.map((s) => toShopResponse(s, admin.shopId)),
       message: "Success",
     };
+  });
+
+  // ── POST /api/admin/shops — Create Branch (Central Admin only) ──────
+  // The ONLY way a branch comes into existence (Cashier signup no longer
+  // creates them). Does not change the admin's currently selected shop.
+  fastify.post("/", { preHandler: centralAdminOnly("create branches") }, async (request, reply) => {
+    const admin = request.authUser!;
+    const body = parseBody(createBranchSchema, request.body);
+
+    const shop = await createBranch(body.location, admin.id);
+    await ensureAdminShopLink(admin.id, shop.id);
+
+    await recordAudit({
+      action: "SHOP_CREATED",
+      actorId: admin.id,
+      actorRole: "ADMIN",
+      shopId: shop.id,
+      entityType: "Shop",
+      entityId: shop.id,
+    });
+
+    return reply.code(201).send({ success: true, data: toShopResponse(shop, admin.shopId), message: "Branch created." });
   });
 
   // ── POST /api/admin/shops/switch — change the admin's active shop ────

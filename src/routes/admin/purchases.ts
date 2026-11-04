@@ -6,8 +6,7 @@ import { recordAudit } from "../../lib/audit.js";
 import { toAdminPurchase, paginate, UNIT_MAP, UNIT_MAP_REVERSE } from "../../lib/serializeAdmin.js";
 import { toDecimal, add, mul, round2, ZERO, toNumber } from "../../lib/money.js";
 import { adjustStock } from "../../services/inventoryService.js";
-import { assertCashierBelongsToShop } from "../../lib/cashierAccess.js";
-import { Errors } from "../../lib/errors.js";
+import { AppError, Errors } from "../../lib/errors.js";
 import {
   buildCsvBuffer,
   buildExcelBuffer,
@@ -16,6 +15,16 @@ import {
   extensionFor,
   type ExportColumn,
 } from "../../services/exportService.js";
+import { assignedToShop } from "../../lib/branchCatalog.js";
+import { resolveStockCashier } from "../../lib/stockActor.js";
+import { centralAdminOnly } from "../../lib/centralAdmin.js";
+
+const reverseSchema = z.object({
+  // Mandatory: the audit trail must say why stock was taken back out.
+  reason: z.string().trim().min(3, "A reason is required to reverse a purchase.").max(500),
+  // CASHIER mode (pre-cutover) only: whose legacy inventory to deduct from.
+  cashierId: z.string().trim().min(1).optional(),
+});
 
 const querySchema = z.object({
   search: z.string().optional(),
@@ -41,12 +50,15 @@ const purchaseSchema = z.object({
   supplierName: z.string().trim().min(1),
   invoiceNumber: z.string().trim().min(1),
   purchaseDate: z.string().min(1),
-  // Cashier-level inventory foundation: every catalog item in this
-  // purchase increases THIS cashier's own inventory, never a shop-wide
-  // pool. Required even if every line is a purchase-only item (Option 2,
-  // never touches stock) — simpler and more predictable than making it
-  // conditionally required, and harmless when unused.
-  cashierId: z.string().trim().min(1, "Select which cashier receives this stock."),
+  // Before the BranchInventory cutover (Stage 2.3) stock is cashier-owned:
+  // every catalog item increases THIS cashier's own inventory, so the id is
+  // required. After the cutover stock belongs to the branch and this is
+  // optional actor metadata. Enforced by resolveStockCashier().
+  cashierId: z.string().trim().min(1).optional(),
+  // Stage 2.6: the receiving branch is chosen EXPLICITLY by the Central
+  // Admin. It is never inferred from the Global Shop Selector, so changing
+  // the selector later cannot affect this (or any existing) purchase.
+  receivingShopId: z.string().trim().min(1, "Select the receiving branch."),
   items: z
     .array(
       z.object({
@@ -77,7 +89,7 @@ export default async function adminPurchasesRoutes(fastify: FastifyInstance) {
     const [items, total] = await Promise.all([
       prisma.purchase.findMany({
         where,
-        include: { items: true },
+        include: { items: true, reversal: true, shop: { select: { name: true } } },
         orderBy: { createdAt: "desc" },
         skip: (q.page - 1) * q.pageSize,
         take: q.pageSize,
@@ -101,7 +113,7 @@ export default async function adminPurchasesRoutes(fastify: FastifyInstance) {
     const [items, shop] = await Promise.all([
       prisma.purchase.findMany({
         where,
-        include: { items: true, createdBy: true },
+        include: { items: true, createdBy: true, reversal: true, shop: { select: { name: true } } },
         orderBy: { createdAt: "desc" },
       }),
       prisma.shop.findUnique({ where: { id: admin.shopId! } }),
@@ -117,6 +129,8 @@ export default async function adminPurchasesRoutes(fastify: FastifyInstance) {
       { key: "tax", header: "Tax", width: 12 },
       { key: "grandTotal", header: "Grand Total", width: 14 },
       { key: "status", header: "Status", width: 12 },
+      { key: "receivingBranch", header: "Receiving Branch", width: 22 },
+      { key: "reversal", header: "Reversal", width: 30 },
       { key: "createdBy", header: "Created By", width: 20 },
       { key: "createdAt", header: "Created At", width: 22 },
     ];
@@ -130,6 +144,8 @@ export default async function adminPurchasesRoutes(fastify: FastifyInstance) {
       tax: toNumber(p.tax),
       grandTotal: toNumber(p.grandTotal),
       status: p.status.charAt(0) + p.status.slice(1).toLowerCase(),
+      receivingBranch: p.shop?.name ?? "",
+      reversal: p.reversal ? `Reversed: ${p.reversal.reason}` : "",
       createdBy: p.createdBy?.name ?? "System",
       createdAt: p.createdAt.toISOString(),
     }));
@@ -147,27 +163,28 @@ export default async function adminPurchasesRoutes(fastify: FastifyInstance) {
   // ── POST /api/admin/purchases ────────────────────────────────────────
   // Transactional: creates the purchase + line items and increases stock
   // for every product in one atomic operation.
-  fastify.post("/", async (request, reply) => {
+  fastify.post("/", { preHandler: centralAdminOnly("record purchases") }, async (request, reply) => {
     const admin = request.authUser!;
     const body = parseBody(purchaseSchema, request.body);
 
-    // Never trust the admin-selected cashierId at face value — confirm it
-    // actually belongs to this admin's shop before any stock moves.
-    await assertCashierBelongsToShop(admin.shopId!, body.cashierId);
+    // Explicit receiving branch — must exist. Stock goes ONLY here.
+    const receivingShop = await prisma.shop.findUnique({ where: { id: body.receivingShopId } });
+    if (!receivingShop) throw Errors.notFound("Receiving branch not found.", "SHOP_NOT_FOUND");
+    const receivingShopId = receivingShop.id;
 
-    // Split once: catalog items (real productId, must resolve against this
-    // shop's Product Catalog and move stock) vs purchase-only items (no
-    // productId — never touch Product or inventory). Every item still
-    // contributes to the purchase's totals and gets its own persisted row.
+    // Never trust the admin-selected cashierId at face value — confirm it
+    // actually belongs to the RECEIVING branch before any stock moves.
+    const stockCashierId = await resolveStockCashier(receivingShopId, body.cashierId);
+
     const catalogItems = body.items.filter((i) => !!i.productId);
     const purchaseOnlyItems = body.items.filter((i) => !i.productId);
 
     const productIds = [...new Set(catalogItems.map((i) => i.productId!))];
-    const products = await prisma.product.findMany({ where: { id: { in: productIds }, shopId: admin.shopId! } });
+    const products = await prisma.product.findMany({ where: { id: { in: productIds }, ...assignedToShop(receivingShopId) } });
     const productMap = new Map(products.map((p) => [p.id, p]));
     for (const item of catalogItems) {
       if (!productMap.has(item.productId!)) {
-        throw Errors.notFound(`Product not found: ${item.productId}`, "PRODUCT_NOT_FOUND");
+        throw Errors.notFound(`Product not found at the receiving branch: ${item.productId}`, "PRODUCT_NOT_FOUND");
       }
     }
 
@@ -179,7 +196,7 @@ export default async function adminPurchasesRoutes(fastify: FastifyInstance) {
     const purchase = await prisma.$transaction(async (tx) => {
       const created = await tx.purchase.create({
         data: {
-          shopId: admin.shopId!,
+          shopId: receivingShopId, // persisted receiving branch (immutable)
           supplierName: body.supplierName,
           invoiceNumber: body.invoiceNumber,
           purchaseDate: new Date(body.purchaseDate),
@@ -202,7 +219,7 @@ export default async function adminPurchasesRoutes(fastify: FastifyInstance) {
             })),
           },
         },
-        include: { items: true },
+        include: { items: true, reversal: true, shop: { select: { name: true } } },
       });
 
       // Only catalog items move stock. Purchase-only items were never in
@@ -211,8 +228,8 @@ export default async function adminPurchasesRoutes(fastify: FastifyInstance) {
       // never creates a Product row).
       for (const item of catalogItems) {
         await adjustStock(tx, {
-          shopId: admin.shopId!,
-          cashierId: body.cashierId,
+          shopId: receivingShopId,
+          cashierId: stockCashierId,
           productId: item.productId!,
           delta: item.quantity,
           type: "IN",
@@ -228,12 +245,100 @@ export default async function adminPurchasesRoutes(fastify: FastifyInstance) {
       action: "PURCHASE_CREATED",
       actorId: admin.id,
       actorRole: "ADMIN",
-      shopId: admin.shopId,
+      shopId: receivingShopId,
       entityType: "Purchase",
       entityId: purchase.id,
-      metadata: { invoiceNumber: purchase.invoiceNumber, purchaseOnlyItemCount: purchaseOnlyItems.length, cashierId: body.cashierId },
+      metadata: { invoiceNumber: purchase.invoiceNumber, purchaseOnlyItemCount: purchaseOnlyItems.length, cashierId: stockCashierId },
     });
 
     return reply.code(201).send(toAdminPurchase(purchase));
   });
+
+  // ── POST /api/admin/purchases/:id/reverse ─────────────────────────────
+  // Stage 2.6: the ONLY way to correct a completed purchase. Central Admin
+  // only; independent of the Global Shop Selector (acts on the purchase's own
+  // receiving branch). In ONE transaction it records a linked reversal and
+  // takes the received quantities back out of that branch's stock (negative
+  // OUT movements). The original purchase, its items and its history are
+  // never edited or deleted. Blocked — with nothing written — if any item
+  // would drive the branch's stock negative. A purchase can be reversed once.
+  fastify.post<{ Params: { id: string } }>(
+    "/:id/reverse",
+    { preHandler: centralAdminOnly("reverse purchases") },
+    async (request) => {
+      const admin = request.authUser!;
+      const body = parseBody(reverseSchema, request.body);
+
+      const purchase = await prisma.purchase.findUnique({
+        where: { id: request.params.id },
+        include: { items: true, reversal: true },
+      });
+      if (!purchase) throw Errors.notFound("Purchase not found.", "PURCHASE_NOT_FOUND");
+      if (purchase.reversal) throw Errors.conflict("This purchase has already been reversed.", "PURCHASE_ALREADY_REVERSED");
+      if (purchase.status !== "RECEIVED") {
+        throw Errors.conflict("Only a received purchase can be reversed.", "PURCHASE_NOT_REVERSIBLE");
+      }
+
+      const stockCashierId = await resolveStockCashier(purchase.shopId, body.cashierId);
+      const catalogItems = purchase.items.filter((i) => !!i.productId);
+
+      try {
+        await prisma.$transaction(async (tx) => {
+          // Unique(purchaseId): a concurrent/duplicate reversal fails right
+          // here (P2002), before any stock is touched.
+          await tx.purchaseReversal.create({
+            data: { purchaseId: purchase.id, reason: body.reason, reversedById: admin.id },
+          });
+          for (const item of catalogItems) {
+            try {
+              await adjustStock(tx, {
+                shopId: purchase.shopId,
+                cashierId: stockCashierId,
+                productId: item.productId!,
+                delta: -item.quantity,
+                type: "OUT",
+                reason: `Reversal of purchase ${purchase.invoiceNumber} — ${body.reason}`,
+                actorId: admin.id,
+              });
+            } catch (err) {
+              if (err instanceof AppError && err.code === "INSUFFICIENT_STOCK") {
+                throw Errors.conflict(
+                  `Cannot reverse: removing ${item.quantity} of "${item.productName}" would make this branch's stock negative. ${err.message}`,
+                  "PURCHASE_REVERSAL_BLOCKED"
+                );
+              }
+              if (err instanceof AppError && err.code === "PRODUCT_NOT_FOUND") {
+                throw Errors.conflict(
+                  `Cannot reverse: "${item.productName}" is not currently assigned to the receiving branch. Re-assign it (its stock is preserved) and try again.`,
+                  "PURCHASE_REVERSAL_BLOCKED"
+                );
+              }
+              throw err;
+            }
+          }
+        });
+      } catch (err) {
+        if (typeof err === "object" && err && (err as { code?: string }).code === "P2002") {
+          throw Errors.conflict("This purchase has already been reversed.", "PURCHASE_ALREADY_REVERSED");
+        }
+        throw err;
+      }
+
+      await recordAudit({
+        action: "PURCHASE_REVERSED",
+        actorId: admin.id,
+        actorRole: "ADMIN",
+        shopId: purchase.shopId,
+        entityType: "Purchase",
+        entityId: purchase.id,
+        metadata: { invoiceNumber: purchase.invoiceNumber, reason: body.reason, reversedItemCount: catalogItems.length, cashierId: stockCashierId },
+      });
+
+      const fresh = await prisma.purchase.findUniqueOrThrow({
+        where: { id: purchase.id },
+        include: { items: true, reversal: true, shop: { select: { name: true } } },
+      });
+      return toAdminPurchase(fresh);
+    }
+  );
 }

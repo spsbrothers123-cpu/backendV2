@@ -1,18 +1,55 @@
-import type { Prisma, PrismaClient, StockMovementType } from "@prisma/client";
+import type { Prisma, PrismaClient, Product, StockMovementType } from "@prisma/client";
 import { Errors } from "../lib/errors.js";
+import { assignedToShop } from "../lib/branchCatalog.js";
+
+type Db = Prisma.TransactionClient | PrismaClient;
+
+/**
+ * Which table is the AUTHORITATIVE stock source (Phase 2 Stage 2.3).
+ *
+ *   CASHIER — legacy: CashierInventory rows are the source (default until the
+ *             authorized cutover; behaviour identical to Stages <= 2.2).
+ *   BRANCH  — BranchInventory (one row per branch + product) is the source.
+ *             CashierInventory receives NO new writes.
+ *
+ * Stored in system_flags('inventory_source'); flipped only by the cutover
+ * script, atomically with the verified backfill.
+ */
+export type InventoryMode = "CASHIER" | "BRANCH";
+
+const FLAG_KEY = "inventory_source";
+
+/**
+ * Reads the inventory source.
+ *
+ * `lock: true` takes a SHARED row lock on the flag, held until the calling
+ * transaction ends. Every stock-changing transaction does this, and the
+ * cutover takes the same row FOR UPDATE — so the switch waits for in-flight
+ * stock transactions and no new one can start until it commits. Shared locks
+ * never block each other, so normal traffic is unaffected. Pass a
+ * transaction client when locking; outside a transaction the lock is
+ * released immediately (fine for read-only display).
+ *
+ * A missing row (migration not applied yet) is treated as CASHIER: the safe,
+ * legacy behaviour.
+ */
+export async function getInventoryMode(db: Db, opts: { lock?: boolean } = {}): Promise<InventoryMode> {
+  const rows = opts.lock
+    ? await db.$queryRaw<{ value: string }[]>`SELECT "value" FROM "system_flags" WHERE "key" = ${FLAG_KEY} FOR SHARE`
+    : await db.$queryRaw<{ value: string }[]>`SELECT "value" FROM "system_flags" WHERE "key" = ${FLAG_KEY}`;
+  return rows[0]?.value === "BRANCH" ? "BRANCH" : "CASHIER";
+}
 
 interface AdjustStockInput {
   shopId: string;
   /**
-   * Whose CashierInventory row this change applies to. Cashier-level
-   * inventory foundation: every unit of stock belongs to exactly one
-   * cashier, never a shared shop-wide pool — so this is required for
-   * every call site (sale, purchase intake, manual adjustment). Callers
-   * must resolve this server-side (the authenticated cashier for a sale,
-   * or an admin-selected cashier already verified with
-   * assertCashierBelongsToShop) — never trust it from an unrelated party.
+   * CASHIER mode: whose CashierInventory row this change applies to —
+   * required (stock is cashier-owned).
+   * BRANCH mode: ACTOR METADATA ONLY. Stock belongs to the branch, so this
+   * never decides which row changes; it is just recorded on the movement
+   * (the selling cashier for a sale). Optional.
    */
-  cashierId: string;
+  cashierId?: string | null;
   productId: string;
   /** Signed delta: positive increases stock, negative decreases it. */
   delta: number;
@@ -20,51 +57,129 @@ interface AdjustStockInput {
   reason: string;
   /**
    * Who performed the action. Equal to cashierId for a POS sale; the
-   * acting admin's id for a purchase or manual adjustment made on a
-   * cashier's behalf.
+   * acting admin's id for a purchase or manual adjustment.
    */
   actorId?: string | null;
+  /**
+   * Stage 2.7: stock RESTORATION for a cancelled bill must reach the bill's
+   * original branch even if the product was unassigned there afterwards
+   * (unassigning hides a product but preserves its stock). When true the
+   * product need only exist; it is never used for sales or purchases.
+   */
+  allowUnassigned?: boolean;
 }
 
 /**
- * Applies a stock change atomically, scoped to one cashier's inventory,
- * and records the movement. Used by:
- *  - billing (SALE, negative delta, inside the checkout transaction) —
- *    decrements the selling cashier's own CashierInventory row.
- *  - admin manual adjustments (ADJUSTMENT, either sign) — targets whichever
- *    cashier the admin selected.
- *  - purchases (IN, positive delta) — targets whichever cashier the admin
- *    selected to receive the purchased stock.
+ * Applies a stock change atomically and records the movement. Used by
+ * billing (SALE), admin adjustments (ADJUSTMENT) and purchases (IN).
  *
- * Product.stock is maintained alongside CashierInventory.quantity as a
- * denormalized SUM across every cashier for that product (for shop-wide
- * Admin views only — see the schema doc comment). A single cashier's
- * delta changes that sum by the same delta, so it's updated in place
- * rather than re-aggregated.
+ * Product.stock is the derived aggregate across ALL branches and is kept in
+ * step by the same delta, in the same transaction, in both modes.
  *
- * Concurrency safety: the CashierInventory change is a single conditional
- * UPDATE (`quantity = quantity + delta WHERE quantity + delta >= 0`),
- * which Postgres executes atomically per-row regardless of transaction
- * isolation level. Two concurrent decrements racing for the last units of
- * the SAME cashier's stock will never both succeed — the loser's WHERE
- * clause fails to match and updatedCount is 0. Two different cashiers'
- * stock never contends with each other at all, by construction.
+ * Concurrency: the decrement is a single conditional UPDATE
+ * (`quantity = quantity - n WHERE quantity >= n`), executed atomically per
+ * row by Postgres at any isolation level. Two concurrent requests for the
+ * last unit can never both succeed — the loser matches zero rows.
+ * (Branch mode serialises on the one BranchInventory row of that
+ * branch+product, which is exactly the contention that must be serialised.)
  */
 export async function adjustStock(
-  tx: Prisma.TransactionClient | PrismaClient,
+  tx: Db,
   input: AdjustStockInput
 ): Promise<{ previousStock: number; newStock: number }> {
-  const product = await tx.product.findUnique({ where: { id: input.productId } });
-  if (!product || product.shopId !== input.shopId) {
+  // Shared lock on the source flag for the rest of this transaction.
+  const mode = await getInventoryMode(tx, { lock: true });
+
+  // Stage 2.2: the product must be ASSIGNED to this branch (BranchProduct),
+  // not merely have originated here (Product.shopId is legacy metadata).
+  // Same error as "no such product", so an unassigned/foreign product's
+  // existence is never revealed.
+  const product = await tx.product.findFirst({
+    where: input.allowUnassigned
+      ? { id: input.productId, branchProducts: { some: { shopId: input.shopId } } }
+      : { id: input.productId, ...assignedToShop(input.shopId) },
+  });
+  if (!product) {
     throw Errors.notFound("Product not found.", "PRODUCT_NOT_FOUND");
   }
 
-  const inventoryKey = {
-    shopId_cashierId_productId: {
+  return mode === "BRANCH" ? adjustBranchStock(tx, input, product) : adjustCashierStock(tx, input, product);
+}
+
+// ── BRANCH mode (authoritative: BranchInventory) ─────────────────────────
+async function adjustBranchStock(
+  tx: Db,
+  input: AdjustStockInput,
+  product: Product
+): Promise<{ previousStock: number; newStock: number }> {
+  const key = { shopId_productId: { shopId: input.shopId, productId: input.productId } };
+
+  if (input.delta === 0) {
+    const existing = await tx.branchInventory.findUnique({ where: key });
+    const qty = existing?.quantity ?? 0;
+    return { previousStock: qty, newStock: qty };
+  }
+
+  // Make sure the row exists so the conditional UPDATE below has something
+  // to match (INSERT … ON CONFLICT DO NOTHING — race-safe).
+  await tx.branchInventory.createMany({
+    data: [{ shopId: input.shopId, productId: input.productId, quantity: 0 }],
+    skipDuplicates: true,
+  });
+
+  if (input.delta < 0) {
+    const result = await tx.branchInventory.updateMany({
+      where: { shopId: input.shopId, productId: input.productId, quantity: { gte: -input.delta } },
+      data: { quantity: { decrement: -input.delta } },
+    });
+    if (result.count === 0) {
+      const current = await tx.branchInventory.findUnique({ where: key });
+      throw Errors.conflict(
+        `Insufficient stock for "${product.name}". Available: ${current?.quantity ?? 0}.`,
+        "INSUFFICIENT_STOCK"
+      );
+    }
+  } else {
+    await tx.branchInventory.update({ where: key, data: { quantity: { increment: input.delta } } });
+  }
+
+  // Aggregate across branches, same transaction.
+  await tx.product.update({ where: { id: input.productId }, data: { stock: { increment: input.delta } } });
+
+  const row = await tx.branchInventory.findUniqueOrThrow({ where: key });
+  const previousStock = row.quantity - input.delta;
+
+  await tx.inventoryMovement.create({
+    data: {
       shopId: input.shopId,
-      cashierId: input.cashierId,
       productId: input.productId,
+      // Actor metadata only — never stock ownership.
+      cashierId: input.cashierId ?? null,
+      type: input.type,
+      quantity: input.delta,
+      previousStock,
+      newStock: row.quantity,
+      reason: input.reason,
+      actorId: input.actorId ?? null,
     },
+  });
+
+  return { previousStock, newStock: row.quantity };
+}
+
+// ── CASHIER mode (legacy, until cutover) ─────────────────────────────────
+async function adjustCashierStock(
+  tx: Db,
+  input: AdjustStockInput,
+  product: Product
+): Promise<{ previousStock: number; newStock: number }> {
+  if (!input.cashierId) {
+    throw Errors.validation("Select which cashier this stock change applies to.");
+  }
+  const cashierId = input.cashierId;
+
+  const inventoryKey = {
+    shopId_cashierId_productId: { shopId: input.shopId, cashierId, productId: input.productId },
   };
 
   if (input.delta === 0) {
@@ -74,23 +189,16 @@ export async function adjustStock(
   }
 
   // Ensure a row exists for this (shop, cashier, product) triple so the
-  // conditional UPDATE below always has something to match — a cashier
-  // who has never touched this product yet starts at 0, same as if the
-  // row had always existed.
+  // conditional UPDATE below always has something to match.
   await tx.cashierInventory.upsert({
     where: inventoryKey,
-    create: { shopId: input.shopId, cashierId: input.cashierId, productId: input.productId, quantity: 0 },
+    create: { shopId: input.shopId, cashierId, productId: input.productId, quantity: 0 },
     update: {},
   });
 
   if (input.delta < 0) {
     const result = await tx.cashierInventory.updateMany({
-      where: {
-        shopId: input.shopId,
-        cashierId: input.cashierId,
-        productId: input.productId,
-        quantity: { gte: -input.delta },
-      },
+      where: { shopId: input.shopId, cashierId, productId: input.productId, quantity: { gte: -input.delta } },
       data: { quantity: { decrement: -input.delta } },
     });
     if (result.count === 0) {
@@ -101,17 +209,10 @@ export async function adjustStock(
       );
     }
   } else {
-    await tx.cashierInventory.update({
-      where: inventoryKey,
-      data: { quantity: { increment: input.delta } },
-    });
+    await tx.cashierInventory.update({ where: inventoryKey, data: { quantity: { increment: input.delta } } });
   }
 
-  // Keep the shop-wide denormalized total in sync in the same transaction.
-  await tx.product.update({
-    where: { id: input.productId },
-    data: { stock: { increment: input.delta } },
-  });
+  await tx.product.update({ where: { id: input.productId }, data: { stock: { increment: input.delta } } });
 
   const updatedRow = await tx.cashierInventory.findUniqueOrThrow({ where: inventoryKey });
   const previousStock = updatedRow.quantity - input.delta;
@@ -120,7 +221,7 @@ export async function adjustStock(
     data: {
       shopId: input.shopId,
       productId: input.productId,
-      cashierId: input.cashierId,
+      cashierId,
       type: input.type,
       quantity: input.delta,
       previousStock,
@@ -134,78 +235,121 @@ export async function adjustStock(
 }
 
 /**
- * RBR Egg Mart V2 Phase 1 — New Cashier Initialization.
+ * New Cashier Initialization (legacy, CASHIER mode only).
  *
- * Creates a fresh CashierInventory row, quantity 0, for every product
- * already in `shopId`'s catalog (the catalog itself stays exactly as it
- * is — global/shared across every cashier of that shop, never filtered
- * or duplicated per cashier). Called once, at the moment a cashier is
- * approved (see routes/admin/cashierRequests.ts POST /:id/approve).
- *
- * This is a defensive/explicit step, not a functional prerequisite:
- * getCashierStock/getCashierStockMap above already default an absent row
- * to 0, and adjustStock lazily creates the row on first write — so a
- * cashier with no rows at all already behaves identically to one with
- * all-zero rows. Creating the rows up front just makes "this cashier's
- * fresh inventory" a literal, queryable fact (e.g. for admin inventory
- * screens that list CashierInventory rows directly) rather than an
- * implicit default, and it can never overwrite another cashier's
- * quantities — `skipDuplicates` means it only ever fills in gaps.
+ * Creates a zero-quantity CashierInventory row for every product assigned to
+ * the branch. After the BranchInventory cutover CashierInventory must not
+ * receive new writes, so this is a no-op in BRANCH mode (the cashier simply
+ * sees the branch's stock; nothing is owned per cashier).
  */
 export async function initializeCashierInventory(
-  tx: Prisma.TransactionClient | PrismaClient,
+  tx: Db,
   shopId: string,
   cashierId: string
 ): Promise<{ productsInitialized: number }> {
-  const products = await tx.product.findMany({
-    where: { shopId },
-    select: { id: true },
-  });
+  if ((await getInventoryMode(tx)) === "BRANCH") return { productsInitialized: 0 };
 
-  if (products.length === 0) {
-    return { productsInitialized: 0 };
-  }
+  const products = await tx.product.findMany({ where: assignedToShop(shopId), select: { id: true } });
+  if (products.length === 0) return { productsInitialized: 0 };
 
   const result = await tx.cashierInventory.createMany({
     data: products.map((p) => ({ shopId, cashierId, productId: p.id, quantity: 0 })),
     skipDuplicates: true,
   });
-
   return { productsInitialized: result.count };
 }
 
 /**
- * A specific cashier's current quantity for a product — 0 if they've never
- * had any (no row yet). This is the ONLY correct way to answer "how much
- * stock does this cashier have"; never Product.stock, which is a
- * shop-wide aggregate across every cashier.
+ * Stock a CASHIER sees for one product: their own row in CASHIER mode, the
+ * branch quantity in BRANCH mode (the branch has exactly one cashier and
+ * stock is not cashier-owned).
  */
-export async function getCashierStock(
-  tx: Prisma.TransactionClient | PrismaClient,
-  shopId: string,
-  cashierId: string,
-  productId: string
-): Promise<number> {
-  const row = await tx.cashierInventory.findUnique({
-    where: { shopId_cashierId_productId: { shopId, cashierId, productId } },
-  });
-  return row?.quantity ?? 0;
+export async function getCashierStock(db: Db, shopId: string, cashierId: string, productId: string): Promise<number> {
+  const map = await getCashierStockMap(db, shopId, cashierId, [productId]);
+  return map.get(productId) ?? 0;
 }
 
-/**
- * Bulk version of getCashierStock for listing endpoints — returns a Map
- * from productId to that cashier's quantity (0 for any productId not in
- * the returned map).
- */
+/** Bulk version for listing endpoints; absent ids mean 0. */
 export async function getCashierStockMap(
-  tx: Prisma.TransactionClient | PrismaClient,
+  db: Db,
   shopId: string,
   cashierId: string,
   productIds: string[]
 ): Promise<Map<string, number>> {
   if (productIds.length === 0) return new Map();
-  const rows = await tx.cashierInventory.findMany({
+  if ((await getInventoryMode(db)) === "BRANCH") return getShopStockMap(db, shopId, productIds);
+  const rows = await db.cashierInventory.findMany({
     where: { shopId, cashierId, productId: { in: productIds } },
   });
   return new Map(rows.map((r) => [r.productId, r.quantity]));
+}
+
+/**
+ * Stock of each product AT ONE BRANCH — the correct number for every admin
+ * view, whatever the mode (Product.stock is the all-branch aggregate and is
+ * wrong for a single branch once a product lives in several).
+ *   BRANCH mode:  BranchInventory.quantity.
+ *   CASHIER mode: SUM of that branch's CashierInventory rows.
+ */
+export async function getShopStockMap(db: Db, shopId: string, productIds: string[]): Promise<Map<string, number>> {
+  if (productIds.length === 0) return new Map();
+  if ((await getInventoryMode(db)) === "BRANCH") {
+    const rows = await db.branchInventory.findMany({ where: { shopId, productId: { in: productIds } } });
+    return new Map(rows.map((r) => [r.productId, r.quantity]));
+  }
+  const rows = await db.cashierInventory.groupBy({
+    by: ["productId"],
+    where: { shopId, productId: { in: productIds } },
+    _sum: { quantity: true },
+  });
+  return new Map(rows.map((r) => [r.productId, r._sum.quantity ?? 0]));
+}
+
+/** Same as getShopStockMap but for several branches at once: key `${shopId}:${productId}`. */
+export async function getStockByBranchProduct(
+  db: Db,
+  shopIds: string[],
+  productIds: string[]
+): Promise<Map<string, number>> {
+  if (shopIds.length === 0 || productIds.length === 0) return new Map();
+  if ((await getInventoryMode(db)) === "BRANCH") {
+    const rows = await db.branchInventory.findMany({
+      where: { shopId: { in: shopIds }, productId: { in: productIds } },
+    });
+    return new Map(rows.map((r) => [`${r.shopId}:${r.productId}`, r.quantity]));
+  }
+  const rows = await db.cashierInventory.groupBy({
+    by: ["shopId", "productId"],
+    where: { shopId: { in: shopIds }, productId: { in: productIds } },
+    _sum: { quantity: true },
+  });
+  return new Map(rows.map((r) => [`${r.shopId}:${r.productId}`, r._sum.quantity ?? 0]));
+}
+
+/**
+ * Returns the products with `stock` replaced by that BRANCH's stock, so the
+ * existing serializers and status labels (which read `.stock`) show branch
+ * numbers instead of the all-branch aggregate.
+ */
+export async function withBranchStock<T extends Product>(db: Db, shopId: string, products: T[]): Promise<T[]> {
+  const map = await getShopStockMap(db, shopId, products.map((p) => p.id));
+  return products.map((p) => ({ ...p, stock: map.get(p.id) ?? 0 }));
+}
+
+/**
+ * Stage 3.3 — which of `productIds` have a BranchInventory ROW at this branch.
+ *
+ * A missing row and a row holding 0 both read as stock 0 (see getShopStockMap),
+ * but they mean different things: a missing row is a product that has never
+ * been stocked, counted, purchased or sold here; a 0 row is a genuine zero.
+ * The answer comes only from row existence — never from the quantity — and it
+ * is the same in either inventory mode (it describes BranchInventory itself).
+ */
+export async function getRecordedProductIds(db: Db, shopId: string, productIds: string[]): Promise<Set<string>> {
+  if (productIds.length === 0) return new Set();
+  const rows = await db.branchInventory.findMany({
+    where: { shopId, productId: { in: productIds } },
+    select: { productId: true },
+  });
+  return new Set(rows.map((r: { productId: string }) => r.productId));
 }

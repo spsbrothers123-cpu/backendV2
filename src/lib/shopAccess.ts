@@ -1,6 +1,7 @@
 import type { Shop } from "@prisma/client";
 import { prisma } from "./prisma.js";
 import { Errors } from "./errors.js";
+import { assignAllProductsToBranch } from "./branchCatalog.js";
 import { normalizeShopLocation, shopDisplayName, InvalidShopLocationError } from "./shopLocation.js";
 
 export { SHOP_BRAND_NAME, shopDisplayName } from "./shopLocation.js";
@@ -38,8 +39,15 @@ export async function resolveOrCreateShopByLocation(
   // the loser's create() hits the unique constraint on `code` and is
   // re-resolved to the winner's row rather than erroring the request.
   try {
-    const shop = await prisma.shop.create({
-      data: { name: shopDisplayName(location), code, location },
+    // Phase 2 Stage 2.2: a new branch is assigned EVERY existing global
+    // product, atomically with its creation (no half-initialised branch).
+    // Assignment only — no stock is created, so branch stock starts at zero.
+    const shop = await prisma.$transaction(async (tx) => {
+      const created = await tx.shop.create({
+        data: { name: shopDisplayName(location), code, location },
+      });
+      await assignAllProductsToBranch(tx, created.id, null);
+      return created;
     });
     return { shop, created: true };
   } catch (err) {
@@ -47,6 +55,42 @@ export async function resolveOrCreateShopByLocation(
     if (shop) {
       return { shop, created: false };
     }
+    throw err;
+  }
+}
+
+/**
+ * Phase 2 Stage 2.4 — EXPLICIT branch creation (Central Admin action).
+ *
+ * Unlike resolveOrCreateShopByLocation this never reuses an existing branch:
+ * a location that already exists is a 409, so a typo or a repeat can't
+ * silently alias another branch. The new branch is assigned every existing
+ * global product atomically (stock starts at zero — nothing is created).
+ */
+export async function createBranch(rawLocation: string, actorId: string): Promise<Shop> {
+  let normalized;
+  try {
+    normalized = normalizeShopLocation(rawLocation);
+  } catch (err) {
+    if (err instanceof InvalidShopLocationError) {
+      throw Errors.validation(`location: ${err.message}`);
+    }
+    throw err;
+  }
+  const { location, code } = normalized;
+  const exists = () => Errors.conflict("A branch for this location already exists.", "BRANCH_ALREADY_EXISTS");
+
+  if (await prisma.shop.findUnique({ where: { code } })) throw exists();
+
+  try {
+    return await prisma.$transaction(async (tx) => {
+      const created = await tx.shop.create({ data: { name: shopDisplayName(location), code, location } });
+      await assignAllProductsToBranch(tx, created.id, actorId);
+      return created;
+    });
+  } catch (err) {
+    // Lost a race on the unique `code` — still "already exists", never a 500.
+    if ((err as { code?: string }).code === "P2002") throw exists();
     throw err;
   }
 }

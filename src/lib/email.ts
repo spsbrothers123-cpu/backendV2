@@ -21,12 +21,14 @@ async function send(to: string, subject: string, html: string, text: string) {
   console.log(`[email:console] to=${to} subject="${subject}"\n${text}`);
 }
 
-function wrapHtml(bodyHtml: string): string {
+const DEFAULT_FOOTER = "If you didn't request this, you can safely ignore this email.";
+
+function wrapHtml(bodyHtml: string, footer: string = DEFAULT_FOOTER): string {
   return `<div style="font-family:sans-serif;max-width:480px;margin:0 auto;">
     <h2 style="color:#b45309;">🥚 Egg Mart</h2>
     ${bodyHtml}
     <hr style="margin-top:24px;border:none;border-top:1px solid #eee;" />
-    <p style="font-size:12px;color:#999;">If you didn't request this, you can safely ignore this email.</p>
+    <p style="font-size:12px;color:#999;">${footer}</p>
   </div>`;
 }
 
@@ -61,18 +63,27 @@ export async function sendCashierRejected(to: string, name: string, reason?: str
   await send(to, subject, html, text);
 }
 
-// RBR Egg Mart V2 Phase 1: Forgot Password (Admin + Cashier). `resetUrl`
-// already points at the right frontend (Admin app vs Cashier app) and
-// carries the one-time token as a query param — see routes/auth.ts. The
-// token itself is never included anywhere else in this email.
-export async function sendPasswordReset(to: string, name: string, resetUrl: string) {
-  const subject = "Egg Mart — Reset Your Password";
-  const text = `Hi ${name},\n\nWe received a request to reset your Egg Mart password. Click the link below to choose a new password:\n\n${resetUrl}\n\nThis link expires soon and can only be used once. If you didn't request this, you can safely ignore this email — your password will not change.\n\n— Egg Mart`;
+// Admin Forgot Password (passkey / recovery code). A SECURITY NOTIFICATION
+// only: it contains no link, code or token and nothing in it can be used to
+// act on the account. It exists so a real Admin is told when their password
+// was changed through recovery and can react if it wasn't them.
+export async function sendAdminPasswordRecovered(
+  to: string,
+  name: string,
+  details: { method: "PASSKEY" | "RECOVERY_CODE"; at: Date; ip: string | null }
+) {
+  const how = details.method === "PASSKEY" ? "a registered passkey" : "an emergency recovery code";
+  const when = details.at.toUTCString();
+  const where = details.ip ? ` from IP address ${details.ip}` : "";
+  const subject = "Egg Mart — Your admin password was changed";
+  const text = `Hi ${name},\n\nThe password for your Egg Mart admin account (${to}) was just changed using ${how}${where} at ${when}. All of your signed-in sessions were signed out.\n\nIf this was you, no action is needed. If it was NOT you, someone has access to one of your recovery methods: contact your Egg Mart system owner immediately.\n\n— Egg Mart`;
   const html = wrapHtml(
     `<p>Hi ${escapeHtml(name)},</p>
-     <p>We received a request to reset your Egg Mart password.</p>
-     <p><a href="${resetUrl}" style="display:inline-block;background:#b45309;color:#fff;padding:10px 18px;border-radius:6px;text-decoration:none;">Reset your password</a></p>
-     <p style="font-size:13px;color:#666;">This link expires soon and can only be used once.</p>`
+     <p>The password for your admin account <strong>${escapeHtml(to)}</strong> was changed using ${how}${escapeHtml(where)} at ${escapeHtml(when)}.</p>
+     <p>All of your signed-in sessions were signed out.</p>
+     <p><strong>If this was not you</strong>, someone has access to one of your recovery methods. Contact your Egg Mart system owner immediately.</p>`,
+    // The default footer says "safe to ignore" — wrong for a security alert.
+    "This is an automated security notification. Do not ignore it if you did not make this change."
   );
   await send(to, subject, html, text);
 }

@@ -3,6 +3,8 @@ import { z } from "zod";
 import { prisma } from "../../lib/prisma.js";
 import { toNumber } from "../../lib/money.js";
 import { productStatusLabel, PAYMENT_LABEL } from "../../lib/serializeAdmin.js";
+import { assignedToShop } from "../../lib/branchCatalog.js";
+import { withBranchStock } from "../../services/inventoryService.js";
 
 const kpisQuerySchema = z.object({ range: z.enum(["today", "week", "month", "custom"]).default("today") });
 const salesQuerySchema = z.object({ window: z.enum(["7d", "30d", "3m"]).default("7d") });
@@ -142,7 +144,11 @@ export default async function adminDashboardRoutes(fastify: FastifyInstance) {
   // ── GET /api/admin/dashboard/low-stock ─────────────────────────────────
   fastify.get("/low-stock", async (request) => {
     const admin = request.authUser!;
-    const items = await prisma.product.findMany({ where: { shopId: admin.shopId!, status: "ACTIVE" } });
+    const items = await withBranchStock(
+      prisma,
+      admin.shopId!,
+      await prisma.product.findMany({ where: { ...assignedToShop(admin.shopId!), status: "ACTIVE" } })
+    );
     return items
       .filter((p) => productStatusLabel(p) !== "In Stock")
       .map((p) => ({

@@ -24,6 +24,9 @@ interface HistoryRecord {
   amount: number;
   paymentMethod: string;
   createdBy: string;
+  // Stage 2.7: cancelled sales stay in the list, clearly labelled. Consumers
+  // computing totals must skip status === "Cancelled".
+  status: "Completed" | "Cancelled";
 }
 
 export default async function adminHistoryRoutes(fastify: FastifyInstance) {
@@ -48,7 +51,7 @@ export default async function adminHistoryRoutes(fastify: FastifyInstance) {
 
     if (wantSales) {
       const bills = await prisma.bill.findMany({
-        where: { shopId, status: "PAID", ...(dateFilter ? { createdAt: dateFilter } : {}) },
+        where: { shopId, status: { in: ["PAID", "CANCELLED"] }, ...(dateFilter ? { createdAt: dateFilter } : {}) },
         include: { payments: true, customer: true, cashier: true },
         take: 500,
       });
@@ -63,6 +66,7 @@ export default async function adminHistoryRoutes(fastify: FastifyInstance) {
           amount: toNumber(b.grandTotal),
           paymentMethod: methods.length > 1 ? "Split" : methods[0] ?? "—",
           createdBy: b.cashier?.name ?? "Cashier",
+          status: b.status === "CANCELLED" ? "Cancelled" : "Completed",
         });
       }
     }
@@ -83,6 +87,7 @@ export default async function adminHistoryRoutes(fastify: FastifyInstance) {
           amount: toNumber(p.grandTotal),
           paymentMethod: "—",
           createdBy: p.createdBy?.name ?? "Admin",
+          status: "Completed",
         });
       }
     }
@@ -103,6 +108,7 @@ export default async function adminHistoryRoutes(fastify: FastifyInstance) {
           amount: toNumber(t.amount),
           paymentMethod: t.method ? PAYMENT_LABEL[t.method] : "Cash",
           createdBy: t.actor?.name ?? "Admin",
+          status: "Completed",
         });
       }
     }
@@ -126,7 +132,7 @@ export default async function adminHistoryRoutes(fastify: FastifyInstance) {
     const admin = request.authUser!;
     const bill = await prisma.bill.findFirst({
       where: { shopId: admin.shopId!, OR: [{ billNumber: request.params.reference }, { id: request.params.reference }] },
-      include: { items: true, payments: true, customer: true, cashier: true },
+      include: { items: true, payments: true, customer: true, cashier: true, cancelledBy: true },
     });
     if (!bill) throw Errors.notFound("Sale not found.", "SALE_NOT_FOUND");
 
@@ -139,6 +145,16 @@ export default async function adminHistoryRoutes(fastify: FastifyInstance) {
       paymentMethod: methods.length > 1 ? "Split" : methods[0] ?? "—",
       total: toNumber(bill.grandTotal),
       createdBy: bill.cashier?.name ?? "Cashier",
+      id: bill.id,
+      status: bill.status === "CANCELLED" ? "Cancelled" : bill.status === "PAID" ? "Completed" : "Held",
+      ...(bill.status === "CANCELLED"
+        ? {
+            cancelledAt: bill.cancelledAt?.toISOString(),
+            cancelReason: bill.cancelReason ?? undefined,
+            cancelledBy: bill.cancelledBy?.name ?? undefined,
+            cancelledAfterSessionClose: bill.cancelledAfterSessionClose,
+          }
+        : {}),
     };
   });
 

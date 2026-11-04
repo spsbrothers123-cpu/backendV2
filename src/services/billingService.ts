@@ -3,11 +3,13 @@ import { PrismaClientKnownRequestError } from "@prisma/client/runtime/library.js
 import { prisma } from "../lib/prisma.js";
 import { Errors } from "../lib/errors.js";
 import { toDecimal, add, mul, round2, equalsMoney, toNumber, ZERO } from "../lib/money.js";
+import { getEffectivePrices } from "../lib/pricing.js";
 import { nextBillNumber } from "../lib/billNumber.js";
-import { adjustStock } from "./inventoryService.js";
+import { adjustStock, getCashierStockMap } from "./inventoryService.js";
 import { chargeCredit } from "./creditService.js";
 import { recordAudit } from "../lib/audit.js";
 import { METHOD_MAP_REVERSE, toCashierBill } from "../lib/serializeCashier.js";
+import { assignedToShop } from "../lib/branchCatalog.js";
 
 const BILL_INCLUDE = {
   items: { include: { product: true } },
@@ -19,15 +21,9 @@ const BILL_INCLUDE = {
 interface CheckoutItemInput {
   productId: string;
   quantity: number;
-  /**
-   * Optional bill-only price override for this line, set by the cashier
-   * via the "Selling Price (this bill)" field in the cart editor. When
-   * omitted, the product's catalog `sellingPrice` is used. The catalog
-   * price itself is never touched — this only affects this one bill's
-   * line total. Still resolved/clamped here (never trusted blindly): must
-   * be a finite, non-negative number.
-   */
-  unitPrice?: number;
+  // Stage 2.5: there is intentionally NO price field here. The unit price is
+  // resolved by the backend (branch override, else common price) — a
+  // client-supplied price is never an input to checkout.
 }
 
 interface CheckoutPaymentInput {
@@ -44,6 +40,48 @@ interface CheckoutInput {
   items: CheckoutItemInput[];
   payments: CheckoutPaymentInput[];
   idempotencyKey?: string | null;
+}
+
+/**
+ * Stage 2.7 — backend stock gate for the Cashier's branch.
+ *
+ *  - A product with zero stock can never enter a cart / bill  -> OUT_OF_STOCK
+ *  - Quantity above what is available is refused              -> INSUFFICIENT_STOCK
+ *    (`zeroOnly` skips this second rule: holding a bill reserves nothing,
+ *    so only the zero-stock rule applies there.)
+ *
+ * This is a fast, friendly pre-check against the branch's own stock. It is
+ * NOT the safety net: the authoritative, race-free check is the atomic
+ * conditional UPDATE inside adjustStock() in the checkout transaction, so a
+ * stale read here can never oversell.
+ */
+export async function assertStockAvailable(
+  db: Parameters<typeof getCashierStockMap>[0],
+  input: {
+    shopId: string;
+    cashierId: string;
+    lines: { productId: string; productName: string; quantity: number }[];
+    zeroOnly?: boolean;
+  }
+): Promise<void> {
+  const wanted = new Map<string, { name: string; qty: number }>();
+  for (const l of input.lines) {
+    const cur = wanted.get(l.productId);
+    wanted.set(l.productId, { name: l.productName, qty: (cur?.qty ?? 0) + l.quantity });
+  }
+  const stock = await getCashierStockMap(db, input.shopId, input.cashierId, [...wanted.keys()]);
+  for (const [productId, { name, qty }] of wanted) {
+    const available = stock.get(productId) ?? 0;
+    if (available <= 0) {
+      throw Errors.conflict(`"${name}" is out of stock.`, "OUT_OF_STOCK");
+    }
+    if (!input.zeroOnly && qty > available) {
+      throw Errors.conflict(
+        `Only ${available} of "${name}" available at this branch; the bill asks for ${qty}.`,
+        "INSUFFICIENT_STOCK"
+      );
+    }
+  }
 }
 
 async function findActiveSession(shopId: string, cashierId: string) {
@@ -93,12 +131,15 @@ export async function checkoutBill(input: CheckoutInput) {
 
   // ── Resolve products & prices from the DATABASE — never the frontend. ─
   const productIds = [...new Set(input.items.map((i) => i.productId))];
-  const products = await prisma.product.findMany({ where: { id: { in: productIds }, shopId: input.shopId } });
+  const products = await prisma.product.findMany({ where: { id: { in: productIds }, ...assignedToShop(input.shopId) } });
   const productMap = new Map(products.map((p) => [p.id, p]));
 
   for (const item of input.items) {
     if (!Number.isFinite(item.quantity) || item.quantity <= 0) {
       throw Errors.validation("Each item quantity must be greater than zero.");
+    }
+    if (!Number.isInteger(item.quantity)) {
+      throw Errors.validation("Each item quantity must be a whole number.");
     }
     const product = productMap.get(item.productId);
     if (!product) {
@@ -107,31 +148,30 @@ export async function checkoutBill(input: CheckoutInput) {
     if (product.status !== "ACTIVE") {
       throw Errors.badRequest(`"${product.name}" is not available for sale.`, "PRODUCT_INACTIVE");
     }
-    if (item.unitPrice != null && (!Number.isFinite(item.unitPrice) || item.unitPrice < 0)) {
-      throw Errors.validation(`Overridden price for "${product.name}" must be a non-negative number.`);
-    }
   }
 
-  // ── Resolve each line's price: the cashier's bill-only override when
-  // present, otherwise the catalog price. The override is never written
-  // back to product.sellingPrice — it only affects this bill's line total,
-  // and it flows through to the payment-total check below so a bill with
-  // overridden prices doesn't get flagged as a mismatch against the stale
-  // catalog total. Kept as an array parallel to input.items (not a
-  // productId-keyed map) so two lines for the same product with different
-  // overrides resolve independently. ──────────────────────────────────
-  const priceOverrides: { productId: string; productName: string; catalogPrice: number; overriddenPrice: number }[] = [];
+  // ── Stage 2.7: reject zero-stock / over-stock lines up front (this branch's
+  // stock only). The atomic deduction below remains the real guarantee. ──
+  await assertStockAvailable(prisma, {
+    shopId: input.shopId,
+    cashierId: input.cashierId,
+    lines: input.items.map((i) => ({
+      productId: i.productId,
+      productName: productMap.get(i.productId)!.name,
+      quantity: i.quantity,
+    })),
+  });
+
+  // ── Resolve each line's price on the SERVER: the branch's price override
+  // when set, otherwise the common catalog price (Stage 2.5). Kept as an
+  // array parallel to input.items so two lines for the same product resolve
+  // independently. The resolved prices are re-checked inside the transaction
+  // below, so a price change that lands between this read and the commit can
+  // never produce a bill at a price the payment totals weren't validated for.
+  const effectivePrices = await getEffectivePrices(prisma, input.shopId, products);
   const resolvedItems = input.items.map((item) => {
     const product = productMap.get(item.productId)!;
-    const unitPrice = item.unitPrice != null ? toDecimal(item.unitPrice) : product.sellingPrice;
-    if (item.unitPrice != null && !round2(unitPrice).equals(round2(product.sellingPrice))) {
-      priceOverrides.push({
-        productId: product.id,
-        productName: product.name,
-        catalogPrice: toNumber(product.sellingPrice),
-        overriddenPrice: toNumber(round2(unitPrice)),
-      });
-    }
+    const unitPrice = effectivePrices.get(product.id)!;
     return { item, product, unitPrice };
   });
 
@@ -172,13 +212,30 @@ export async function checkoutBill(input: CheckoutInput) {
 
   try {
     const bill = await prisma.$transaction(async (tx) => {
-      // Stock deduction — atomic and concurrency-safe per line item.
-      for (const item of input.items) {
+      // Re-resolve prices inside the transaction; abort (nothing written) if
+      // an admin changed a price after the totals were validated above.
+      const txPrices = await getEffectivePrices(tx, input.shopId, products);
+      for (const { product, unitPrice } of resolvedItems) {
+        if (!txPrices.get(product.id)?.equals(unitPrice)) {
+          throw Errors.conflict(
+            `The price of "${product.name}" changed while billing. Please review the cart and try again.`,
+            "PRICE_CHANGED"
+          );
+        }
+      }
+
+      // Stock deduction — atomic and concurrency-safe per line item. Lines are
+      // taken in a fixed (productId) order so two concurrent checkouts that
+      // share products always lock inventory rows in the same order and can
+      // never deadlock each other.
+      const deductionOrder = [...input.items].sort((a, b) => (a.productId < b.productId ? -1 : a.productId > b.productId ? 1 : 0));
+      for (const item of deductionOrder) {
         await adjustStock(tx, {
           shopId: input.shopId,
-          // Sale always decrements the selling cashier's OWN inventory —
-          // input.cashierId is the authenticated cashier from the route
-          // (request.authUser!.id), never a value trusted from the body.
+          // Stock is deducted from THIS branch only (shopId from the
+          // authenticated cashier). cashierId is the authenticated cashier
+          // from the route, never a body value: it owns the row before the
+          // BranchInventory cutover and is actor metadata afterwards.
           cashierId: input.cashierId,
           productId: item.productId,
           delta: -item.quantity,
@@ -255,7 +312,6 @@ export async function checkoutBill(input: CheckoutInput) {
       metadata: {
         billNumber: bill.billNumber,
         grandTotal: toNumber(bill.grandTotal),
-        ...(priceOverrides.length > 0 ? { priceOverrides } : {}),
       },
     });
     await recordAudit({

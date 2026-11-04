@@ -2,6 +2,8 @@ import type { FastifyInstance } from "fastify";
 import { prisma } from "../lib/prisma.js";
 import { toCashierProduct } from "../lib/serializeCashier.js";
 import { getCashierStockMap } from "../services/inventoryService.js";
+import { assignedToShop } from "../lib/branchCatalog.js";
+import { getEffectivePrices } from "../lib/pricing.js";
 
 export default async function productsRoutes(fastify: FastifyInstance) {
   fastify.addHook("preHandler", fastify.requireRole("CASHIER"));
@@ -17,15 +19,18 @@ export default async function productsRoutes(fastify: FastifyInstance) {
 
     if (barcode) {
       const products = await prisma.product.findMany({
-        where: { shopId, status: "ACTIVE", barcode },
+        where: { ...assignedToShop(shopId), status: "ACTIVE", barcode },
       });
       const stockMap = await getCashierStockMap(prisma, shopId, cashierId, products.map((p) => p.id));
-      return products.map((p) => toCashierProduct(p, stockMap.get(p.id) ?? 0));
+      const prices = await getEffectivePrices(prisma, shopId, products);
+      return products.map((p) => toCashierProduct(p, stockMap.get(p.id) ?? 0, prices.get(p.id)));
     }
 
     const products = await prisma.product.findMany({
       where: {
-        shopId,
+        // Stage 2.2: visibility comes from BranchProduct (assigned to THIS
+        // cashier's branch), never from Product.shopId (legacy origin).
+        ...assignedToShop(shopId),
         status: "ACTIVE",
         ...(category && category !== "All" ? { category } : {}),
         ...(query
@@ -41,14 +46,15 @@ export default async function productsRoutes(fastify: FastifyInstance) {
       orderBy: { name: "asc" },
     });
     const stockMap = await getCashierStockMap(prisma, shopId, cashierId, products.map((p) => p.id));
-    return products.map((p) => toCashierProduct(p, stockMap.get(p.id) ?? 0));
+    const prices = await getEffectivePrices(prisma, shopId, products);
+    return products.map((p) => toCashierProduct(p, stockMap.get(p.id) ?? 0, prices.get(p.id)));
   });
 
   // ── GET /api/products/categories ──────────────────────────────────────
   fastify.get("/categories", async (request) => {
     const shopId = request.authUser!.shopId!;
     const rows = await prisma.product.findMany({
-      where: { shopId, status: "ACTIVE" },
+      where: { ...assignedToShop(shopId), status: "ACTIVE" },
       select: { category: true },
       distinct: ["category"],
       orderBy: { category: "asc" },

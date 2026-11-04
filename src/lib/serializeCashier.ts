@@ -12,7 +12,7 @@ import type {
   CashierSession,
   Shop,
 } from "@prisma/client";
-import { toNumber } from "./money.js";
+import { toNumber, type Money } from "./money.js";
 
 const UNIT_MAP: Record<string, string> = {
   KG: "kg",
@@ -42,14 +42,18 @@ export const METHOD_MAP_REVERSE: Record<string, string> = { cash: "CASH", card: 
  * informational display of a past line item, not a live "can I sell this"
  * check, so the shop-wide aggregate is an acceptable snapshot value.
  */
-export function toCashierProduct(p: Product, cashierStock?: number): Record<string, unknown> {
+export function toCashierProduct(p: Product, cashierStock?: number, effectivePrice?: Money): Record<string, unknown> {
   return {
     id: p.id,
     name: p.name,
     sku: p.sku ?? undefined,
     barcode: p.barcode ?? undefined,
     category: p.category,
-    price: toNumber(p.sellingPrice),
+    // Stage 2.5: for any live "what do I sell it for" view, `effectivePrice`
+    // (branch override, else common price — resolved server-side) is passed in.
+    // Omitted only for historical snapshots (receipts/history), where the
+    // authoritative figure is the bill line's own unitPrice, not this field.
+    price: toNumber(effectivePrice ?? p.sellingPrice),
     unit: UNIT_MAP[p.unit] ?? p.unit.toLowerCase(),
     stock: cashierStock ?? p.stock,
   };
@@ -103,6 +107,10 @@ export function toCashierBill(b: BillWithRelations): Record<string, unknown> {
     status: b.status === "PAID" ? "paid" : b.status.toLowerCase(),
     createdAt: b.createdAt.toISOString(),
     idempotencyKey: b.idempotencyKey ?? undefined,
+    // Stage 2.7: present only on cancelled bills (status is "cancelled").
+    ...(b.status === "CANCELLED"
+      ? { cancelledAt: b.cancelledAt?.toISOString(), cancelReason: b.cancelReason ?? undefined }
+      : {}),
   };
 }
 

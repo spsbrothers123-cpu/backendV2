@@ -6,8 +6,10 @@ import { Errors } from "../lib/errors.js";
 import { parseBody } from "../lib/validate.js";
 import { recordAudit } from "../lib/audit.js";
 import { toCashierBill, toHeldBill, METHOD_MAP_REVERSE } from "../lib/serializeCashier.js";
-import { checkoutBill } from "../services/billingService.js";
-import { add, mul, round2, toDecimal, ZERO } from "../lib/money.js";
+import { checkoutBill, assertStockAvailable } from "../services/billingService.js";
+import { add, mul, round2, ZERO } from "../lib/money.js";
+import { assignedToShop } from "../lib/branchCatalog.js";
+import { getEffectivePrices } from "../lib/pricing.js";
 
 const BILL_INCLUDE = {
   items: { include: { product: true } },
@@ -24,10 +26,8 @@ const holdSchema = z.object({
       z.object({
         product: z.object({ id: z.string() }),
         quantity: z.number().positive(),
-        // Bill-only price override from the cart's "Selling Price (this
-        // bill)" field — see billingService.ts. Optional; falls back to
-        // catalog price when omitted.
-        unitPrice: z.number().nonnegative().optional(),
+        // Stage 2.5: no client price. Unknown keys (e.g. a stale client's
+        // `unitPrice`) are stripped by zod and never read.
       })
     )
     .min(1, "Cannot hold an empty bill."),
@@ -40,7 +40,6 @@ const checkoutSchema = z.object({
       z.object({
         product: z.object({ id: z.string() }),
         quantity: z.number().positive(),
-        unitPrice: z.number().nonnegative().optional(),
       })
     )
     .min(1),
@@ -63,6 +62,9 @@ const historyQuerySchema = z.object({
   dateTo: z.string().optional(),
   paymentMethod: z.string().optional(),
   customerId: z.string().optional(),
+  // Stage 2.7: opt-in so existing clients (which render every row as a sale)
+  // are unchanged until the Cashier UI can label cancelled bills (Stage 2.8).
+  includeCancelled: z.enum(["true", "false"]).optional(),
 });
 
 export default async function billsRoutes(fastify: FastifyInstance) {
@@ -97,14 +99,27 @@ export default async function billsRoutes(fastify: FastifyInstance) {
     }
 
     const productIds = body.items.map((i) => i.product.id);
-    const products = await prisma.product.findMany({ where: { id: { in: productIds }, shopId: cashier.shopId! } });
+    const products = await prisma.product.findMany({ where: { id: { in: productIds }, ...assignedToShop(cashier.shopId!) } });
     const productMap = new Map(products.map((p) => [p.id, p]));
 
+    // Stage 2.7: a zero-stock product cannot enter a cart, held or not.
+    await assertStockAvailable(prisma, {
+      shopId: cashier.shopId!,
+      cashierId: cashier.id,
+      zeroOnly: true,
+      lines: body.items.flatMap((i) => {
+        const p = productMap.get(i.product.id);
+        return p ? [{ productId: p.id, productName: p.name, quantity: i.quantity }] : [];
+      }),
+    });
+
+    // Stage 2.5: held-bill line prices are resolved server-side too.
+    const effectivePrices = await getEffectivePrices(prisma, cashier.shopId!, products);
     let amount = ZERO;
     const resolvedHoldItems = body.items.map((item) => {
       const product = productMap.get(item.product.id);
       if (!product) throw Errors.notFound(`Product not found: ${item.product.id}`, "PRODUCT_NOT_FOUND");
-      const unitPrice = item.unitPrice != null ? toDecimal(item.unitPrice) : product.sellingPrice;
+      const unitPrice = effectivePrices.get(product.id)!;
       return { item, product, unitPrice };
     });
     for (const { item, unitPrice } of resolvedHoldItems) {
@@ -180,7 +195,7 @@ export default async function billsRoutes(fastify: FastifyInstance) {
         shopId: cashier.shopId!,
         cashierId: cashier.id,
         customerId: body.customer?.id ?? null,
-        items: body.items.map((i) => ({ productId: i.product.id, quantity: i.quantity, unitPrice: i.unitPrice })),
+        items: body.items.map((i) => ({ productId: i.product.id, quantity: i.quantity })),
         payments: body.payments,
         idempotencyKey: body.idempotencyKey ?? null,
       });
@@ -196,7 +211,7 @@ export default async function billsRoutes(fastify: FastifyInstance) {
       where: {
         shopId: cashier.shopId!,
         cashierId: cashier.id,
-        status: "PAID",
+        status: q.includeCancelled === "true" ? { in: ["PAID", "CANCELLED"] } : "PAID",
         ...(q.customerId ? { customerId: q.customerId } : {}),
         ...(q.dateFrom || q.dateTo
           ? { createdAt: { ...(q.dateFrom ? { gte: new Date(q.dateFrom) } : {}), ...(q.dateTo ? { lte: new Date(q.dateTo) } : {}) } }

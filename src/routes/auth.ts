@@ -7,13 +7,14 @@ import { parseBody } from "../lib/validate.js";
 import { hashPassword, verifyPassword, isPasswordStrongEnough } from "../lib/password.js";
 import { hashInvitationCode, invitationCodeMatches, maskInvitationCode } from "../lib/invitationCode.js";
 import { signInvitationToken, verifyInvitationToken } from "../lib/invitationToken.js";
-import { signPasswordResetToken, verifyPasswordResetToken, passwordFingerprint } from "../lib/passwordResetToken.js";
-import { sendPasswordReset } from "../lib/email.js";
 import { recordAudit } from "../lib/audit.js";
 import { issueSession, revokeSession } from "../lib/session.js";
 import { toPublicAdminUser, toPublicCashier } from "../lib/serializers.js";
 import { env } from "../config/env.js";
 import { resolveOrCreateShopByLocation, ensureAdminShopLink } from "../lib/shopAccess.js";
+import { normalizeShopLocation, InvalidShopLocationError } from "../lib/shopLocation.js";
+import { requireRecentAuth } from "../lib/recentAuth.js";
+import { assertBranchCashierSlotFree, lockBranchCashierSlot } from "../lib/branchCashier.js";
 
 const emailSchema = z.string().trim().min(1, "Email is required.").email("Enter a valid email address.");
 
@@ -35,10 +36,10 @@ const registerSchema = z.object({
   name: z.string().trim().min(1, "Name is required.").max(120),
   email: emailSchema,
   password: z.string().min(1, "Password is required."),
-  // Required for every new cashier registration (Backend spec §4). Not
-  // enforced as NOT NULL at the DB level (see the branchName migration) —
-  // this is where "required for new signups" actually lives.
-  branchName: z.string().trim().min(1, "Branch name is required.").max(120),
+  // Phase 2 Stage 2.4: the Cashier SELECTS an existing branch (id from
+  // GET /api/auth/branches). Free-text branch names are no longer accepted
+  // and never create a branch — only the Central Admin can (POST /api/admin/shops).
+  shopId: z.string().trim().min(1, "Select your branch."),
   verificationToken: z.string().trim().min(1, "verificationToken is required."),
 });
 
@@ -46,7 +47,7 @@ const signupStatusQuerySchema = z.object({
   requestId: z.string().trim().min(1, "requestId is required."),
 });
 
-// ── Forgot Password — Admin + Cashier (RBR Egg Mart V2 Phase 1) ─────────
+// ── Forgot Password (legacy email-link flow — DISABLED, see handlers below) ─
 // One shared pair of endpoints for both roles: email is globally unique
 // across the User table (see schema.prisma), so there's nothing
 // role-specific about "look up this email and email it a reset link" —
@@ -55,11 +56,6 @@ const signupStatusQuerySchema = z.object({
 // from a role the caller claims.
 const forgotPasswordSchema = z.object({
   email: emailSchema,
-});
-
-const resetPasswordSchema = z.object({
-  token: z.string().trim().min(1, "Reset token is required."),
-  password: z.string().min(1, "Password is required."),
 });
 
 // ── Admin signup — multi-shop foundation (RBR Egg Mart Phase 1) ─────────
@@ -185,17 +181,14 @@ export default async function authRoutes(fastify: FastifyInstance) {
 
       const passwordHash = await hashPassword(body.password);
 
-      // RBR Egg Mart V2 Phase 1: the shop is resolved from the cashier's own
-      // Branch Name, never from the invitation code (which carries no shop
-      // — see routes/admin/invitationCodes.ts and lib/invitationToken.ts).
-      // Reuses the same find-or-create-by-location logic as Admin signup
-      // (lib/shopAccess.ts) so "Chennai" / "chennai" / " CHENNAI " all
-      // resolve to one shop and a brand-new branch name creates a real
-      // Shop row automatically (Backend spec §6-§9). Done outside the
-      // transaction below, same as admin/signup: resolveOrCreateShopByLocation
-      // is independently race-safe (unique constraint + catch-and-refetch),
-      // so it doesn't need to share a transaction with the invitation claim.
-      const { shop } = await resolveOrCreateShopByLocation(body.branchName);
+      // RBR Egg Mart V2 Phase 2 (Stage 2.4): the Cashier SELECTS an existing
+      // branch. A branch is never created (or looked up by typed text) here —
+      // only the Central Admin creates branches (POST /api/admin/shops).
+      const shop = await prisma.shop.findUnique({ where: { id: body.shopId } });
+      if (!shop) {
+        throw Errors.notFound("Please select a valid branch.", "BRANCH_NOT_FOUND");
+      }
+      const displayBranchName = shop.location ?? shop.name;
 
       // Everything below is one atomic unit: the invitation code can only
       // ever produce ONE successful cashier signup (Backend spec §12/§13).
@@ -212,6 +205,12 @@ export default async function authRoutes(fastify: FastifyInstance) {
           return null;
         }
 
+        // One Cashier per branch (Stage 2.4). Serialised per branch; if the
+        // branch is taken this throws and the transaction rolls back — the
+        // invitation code stays ACTIVE so it can be used for another branch.
+        await lockBranchCashierSlot(tx, shop.id);
+        await assertBranchCashierSlotFree(tx, shop.id, existing?.id);
+
         const invitation = await tx.invitationCode.findUniqueOrThrow({ where: { id: tokenPayload.invitationId } });
 
         // Reconstruct the masked form from the plaintext code one last
@@ -226,7 +225,7 @@ export default async function authRoutes(fastify: FastifyInstance) {
                 passwordHash,
                 status: "PENDING_ADMIN_APPROVAL",
                 shopId: shop.id,
-                branchName: body.branchName,
+                branchName: displayBranchName,
                 rejectedAt: null,
                 rejectedBy: null,
                 rejectionReason: null,
@@ -241,7 +240,7 @@ export default async function authRoutes(fastify: FastifyInstance) {
                 role: "CASHIER",
                 status: "PENDING_ADMIN_APPROVAL",
                 shopId: shop.id,
-                branchName: body.branchName,
+                branchName: displayBranchName,
                 invitationCodeMasked,
               },
             });
@@ -285,6 +284,21 @@ export default async function authRoutes(fastify: FastifyInstance) {
       return reply.code(201).send({ requestId: result.user.id, email: result.user.email });
     }
   );
+
+  // ── GET /api/auth/branches — branch picker for Cashier signup ──────
+  // Public (the Cashier has no account yet) and deliberately minimal: id,
+  // display name, location, and whether the branch can still take a Cashier.
+  fastify.get("/branches", { config: authRateLimit(60, "10 minutes") }, async () => {
+    const [shops, taken] = await Promise.all([
+      prisma.shop.findMany({ orderBy: { name: "asc" }, select: { id: true, name: true, location: true } }),
+      prisma.user.groupBy({
+        by: ["shopId"],
+        where: { role: "CASHIER", status: { in: ["ACTIVE", "PENDING_ADMIN_APPROVAL"] }, shopId: { not: null } },
+      }),
+    ]);
+    const takenIds = new Set(taken.map((t) => t.shopId));
+    return shops.map((s) => ({ id: s.id, name: s.name, location: s.location, available: !takenIds.has(s.id) }));
+  });
 
   // ── GET /api/auth/signup/status ─────────────────────────────────────
   fastify.get("/signup/status", async (request) => {
@@ -338,132 +352,103 @@ export default async function authRoutes(fastify: FastifyInstance) {
     }
   );
 
-  // ── POST /api/auth/admin/signup — create/extend an Admin account ────
-  // Body: { name, email, password, shopLocation }. Resolves-or-creates the
-  // Shop for shopLocation (dedup by normalized location — Phase 1 spec
-  // §2/§3) and links it to the admin.
+  // ── POST /api/auth/admin/signup — an Admin adds a shop to THEIR OWN account ─
+  // SECURITY: this endpoint used to be fully unauthenticated — anyone could
+  // POST a new email + an existing shopLocation, receive an ACTIVE ADMIN
+  // account and be linked to that existing shop. It is now gated:
   //
-  // Two cases, both handled here so "a single Admin can manage multiple
-  // shops" (Phase 1 spec §objective) doesn't require a second endpoint:
-  //   - New email → creates a new ADMIN user, active immediately (matching
-  //     this app's existing "admins aren't approval-gated" policy), with
-  //     this as their first/active shop.
-  //   - Email already belongs to an ACTIVE admin, password matches → adds
-  //     this shop to that admin's owned set (AdminShopLink) WITHOUT
-  //     creating a second account and WITHOUT changing which shop is
-  //     currently their active one (see POST /admin/shops/switch for
-  //     that). Password is re-checked here specifically because this
-  //     endpoint is unauthenticated — knowing someone's admin email alone
-  //     must never be enough to attach a shop to their account.
-  // An email belonging to a CASHIER, or a wrong password on an existing
-  // admin email, is rejected the same way (no hint as to which).
+  //   - Requires a valid ADMIN bearer token (requireRole), same as every
+  //     other /admin route.
+  //   - It can no longer CREATE Admin accounts at all. Admins are created by
+  //     the operator (prisma/seed.ts / database), never through the API, and
+  //     there is no public alternative. `email` must be the caller's own.
+  //   - The caller's current password is re-verified on this request
+  //     (throttled — see lib/recentAuth.ts), so a stolen token alone is not
+  //     enough to change which shops an account owns.
+  //   - It can create a NEW shop, or attach a shop nobody administers yet, but
+  //     it can never link the caller to a shop another Admin already owns.
+  //
+  // Existing login (/admin/login) and Cashier signup are untouched.
   fastify.post(
     "/admin/signup",
-    { config: authRateLimit(10, "10 minutes") },
+    { preHandler: fastify.requireRole("ADMIN"), config: authRateLimit(10, "10 minutes") },
     async (request, reply) => {
       const body = parseBody(adminSignupSchema, request.body);
+      const caller = request.authUser!;
 
-      if (!isPasswordStrongEnough(body.password)) {
-        throw Errors.validation("Password must be at least 8 characters and include a letter and a number.");
+      if (body.email !== caller.email) {
+        throw Errors.forbidden(
+          "Admin accounts can't be created through this endpoint.",
+          "ADMIN_CREATION_DISABLED"
+        );
       }
 
-      const existing = await prisma.user.findUnique({ where: { email: body.email } });
+      await requireRecentAuth(caller.id, body.password, {
+        ip: request.ip,
+        userAgent: request.headers["user-agent"] ?? null,
+      });
 
-      if (existing && existing.role !== "ADMIN") {
-        throw Errors.conflict("An account with this email already exists.", "ACCOUNT_ALREADY_EXISTS");
-      }
-
-      if (existing) {
-        const passwordOk = await verifyPassword(body.password, existing.passwordHash);
-        if (!passwordOk) {
-          throw Errors.unauthorized("Invalid email or password.", "INVALID_CREDENTIALS");
+      let normalizedCode: string;
+      try {
+        normalizedCode = normalizeShopLocation(body.shopLocation).code;
+      } catch (err) {
+        if (err instanceof InvalidShopLocationError) {
+          throw Errors.validation(`shopLocation: ${err.message}`);
         }
-        if (existing.status !== "ACTIVE") {
-          throw Errors.forbidden("This admin account is not active.", "ACCOUNT_NOT_ACTIVE");
-        }
+        throw err;
       }
 
-      const passwordHash = existing ? existing.passwordHash : await hashPassword(body.password);
-
-      // Not wrapped in a single DB transaction: resolveOrCreateShopByLocation
-      // and ensureAdminShopLink are each independently race-safe (unique
-      // constraint + catch-and-refetch — see shopAccess.ts), so sequencing
-      // them plainly is both simpler and no less safe than a transaction
-      // that couldn't actually span them atomically anyway.
-      const { shop, created: shopCreated } = await resolveOrCreateShopByLocation(body.shopLocation);
-
-      const admin = existing
-        ? existing
-        : await prisma.user
-            .create({
-              data: {
-                name: body.name,
-                email: body.email,
-                passwordHash,
-                role: "ADMIN",
-                status: "ACTIVE",
-                shopId: shop.id,
-              },
-            })
-            // Two simultaneous signups for the same brand-new email: the
-            // loser hits the unique constraint on email rather than a
-            // generic 500 (mirrors the "account already exists" message
-            // the earlier findUnique check would have given the loser had
-            // it run a moment later).
-             .catch((err) => {
-              if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002") {
-                throw Errors.conflict("An account with this email already exists.", "ACCOUNT_ALREADY_EXISTS");
-              }
-              throw err;
-            });
-
-      const { linked } = await ensureAdminShopLink(admin.id, shop.id);
-
-      const result = { admin, shop, shopCreated, linked, isNewAdmin: !existing };
-
-      if (result.isNewAdmin) {
-        await recordAudit({
-          action: "ADMIN_SIGNUP",
-          actorId: result.admin.id,
-          actorRole: "ADMIN",
-          shopId: result.shop.id,
-          entityType: "User",
-          entityId: result.admin.id,
+      const existingShop = await prisma.shop.findUnique({ where: { code: normalizedCode } });
+      if (existingShop) {
+        const callerLink = await prisma.adminShopLink.findUnique({
+          where: { adminId_shopId: { adminId: caller.id, shopId: existingShop.id } },
         });
+        const callerIsLegacyOwner = caller.shopId === existingShop.id;
+        if (!callerLink && !callerIsLegacyOwner) {
+          const otherAdmins =
+            (await prisma.adminShopLink.count({
+              where: { shopId: existingShop.id, adminId: { not: caller.id } },
+            })) +
+            (await prisma.user.count({
+              where: { role: "ADMIN", shopId: existingShop.id, id: { not: caller.id } },
+            }));
+          if (otherAdmins > 0) {
+            throw Errors.forbidden(
+              "That shop is already managed by another administrator.",
+              "SHOP_OWNED_BY_ANOTHER_ADMIN"
+            );
+          }
+        }
       }
-      if (result.shopCreated) {
+
+      const { shop, created: shopCreated } = await resolveOrCreateShopByLocation(body.shopLocation);
+      const { linked } = await ensureAdminShopLink(caller.id, shop.id);
+
+      if (shopCreated) {
         await recordAudit({
           action: "SHOP_CREATED",
-          actorId: result.admin.id,
+          actorId: caller.id,
           actorRole: "ADMIN",
-          shopId: result.shop.id,
+          shopId: shop.id,
           entityType: "Shop",
-          entityId: result.shop.id,
+          entityId: shop.id,
         });
       }
-      if (result.linked && !result.isNewAdmin) {
+      if (linked) {
         await recordAudit({
           action: "SHOP_LINKED",
-          actorId: result.admin.id,
+          actorId: caller.id,
           actorRole: "ADMIN",
-          shopId: result.shop.id,
+          shopId: shop.id,
           entityType: "Shop",
-          entityId: result.shop.id,
+          entityId: shop.id,
         });
       }
 
-      const token = await issueSession(result.admin.id, "ADMIN", request);
-      await prisma.user.update({ where: { id: result.admin.id }, data: { lastLoginAt: new Date() } });
-
-      return reply.code(result.isNewAdmin ? 201 : 200).send({
-        token,
-        user: toPublicAdminUser(result.admin),
-        shop: {
-          id: result.shop.id,
-          name: result.shop.name,
-          code: result.shop.code,
-          location: result.shop.location,
-        },
+      const admin = await prisma.user.findUniqueOrThrow({ where: { id: caller.id } });
+      return reply.code(200).send({
+        user: toPublicAdminUser(admin),
+        shop: { id: shop.id, name: shop.name, code: shop.code, location: shop.location },
       });
     }
   );
@@ -505,128 +490,38 @@ export default async function authRoutes(fastify: FastifyInstance) {
     }
   );
 
-  // ── POST /api/auth/forgot-password — Admin + Cashier ─────────────────
-  // Body: { email }. Always returns the same generic success response
-  // whether or not the email is on file, whether the account is a
-  // cashier or admin, and whatever the account's status is — this
-  // endpoint is unauthenticated, so it must never let a caller learn
-  // anything about which emails have accounts (Backend spec: no user
-  // enumeration). If (and only if) a matching, non-suspended account
-  // exists, a one-time reset link is emailed to it, pointed at whichever
-  // frontend that account actually logs into.
+  // ── POST /api/auth/forgot-password — DISABLED (all roles) ─────────────
+  // The emailed reset link is gone for Cashiers: Cashier recovery is now
+  // admin-assisted and in person (routes/cashierRecovery.ts), and Admins use a
+  // passkey or recovery code (routes/adminRecovery.ts). This endpoint remains
+  // ONLY so old clients get a harmless answer: it sends nothing, issues
+  // nothing, and returns the same generic body for every email (no
+  // enumeration). There is no fallback and no token path behind it.
   fastify.post(
     "/forgot-password",
     { config: authRateLimit(5, "10 minutes") },
     async (request) => {
-      const body = parseBody(forgotPasswordSchema, request.body);
-      const genericResponse = {
+      parseBody(forgotPasswordSchema, request.body);
+      return {
         success: true,
         data: null,
-        message: "If an account exists for that email, we've sent a password reset link.",
+        message:
+          "Password reset by email is no longer available. Cashiers: ask your administrator to verify you in person. Admins: use the Admin recovery page.",
       };
-
-      const user = await prisma.user.findUnique({ where: { email: body.email } });
-
-      // No account, or an account that isn't in a state that can log in
-      // anyway (pending approval / rejected / suspended) — say nothing
-      // different to the caller, but also don't send an email that would
-      // just confuse someone whose request was never approved.
-      if (!user || user.status !== "ACTIVE") {
-        return genericResponse;
-      }
-
-      const resetToken = signPasswordResetToken(user.id, user.passwordHash);
-      const appUrl = user.role === "ADMIN" ? env.ADMIN_APP_URL : env.CASHIER_APP_URL;
-      const resetPath = user.role === "ADMIN" ? "/admin/reset-password" : "/cashier/reset-password";
-      const resetUrl = `${appUrl}${resetPath}?token=${encodeURIComponent(resetToken)}`;
-
-      await sendPasswordReset(user.email, user.name, resetUrl);
-
-      await recordAudit({
-        action: "PASSWORD_RESET_REQUESTED",
-        actorId: user.id,
-        actorRole: user.role,
-        shopId: user.shopId,
-        entityType: "User",
-        entityId: user.id,
-      });
-
-      return genericResponse;
     }
   );
 
-  // ── POST /api/auth/reset-password — Admin + Cashier ──────────────────
-  // Body: { token, password }. The token embeds which user it's for and a
-  // fingerprint of their password at issue time (see
-  // lib/passwordResetToken.ts) — nothing about the caller's own session
-  // (there isn't one; this is unauthenticated by design, same as
-  // /forgot-password) needs to be trusted beyond the token itself.
+  // ── POST /api/auth/reset-password — DISABLED (all roles) ──────────────
+  // Reset-by-token no longer exists. Always refused; no token is inspected, so
+  // previously issued emailed links are dead too.
   fastify.post(
     "/reset-password",
     { config: authRateLimit(10, "10 minutes") },
-    async (request) => {
-      const body = parseBody(resetPasswordSchema, request.body);
-
-      let payload;
-      try {
-        payload = verifyPasswordResetToken(body.token);
-      } catch (reason) {
-        if (reason === "EXPIRED") {
-          throw Errors.unauthorized(
-            "This password reset link has expired. Please request a new one.",
-            "PASSWORD_RESET_EXPIRED"
-          );
-        }
-        throw Errors.unauthorized(
-          "This password reset link is invalid. Please request a new one.",
-          "PASSWORD_RESET_INVALID"
-        );
-      }
-
-      const user = await prisma.user.findUnique({ where: { id: payload.userId } });
-      if (!user || user.status !== "ACTIVE") {
-        throw Errors.unauthorized(
-          "This password reset link is invalid. Please request a new one.",
-          "PASSWORD_RESET_INVALID"
-        );
-      }
-
-      // Single-use enforcement: the token only matches if the password
-      // hasn't changed since it was issued (see passwordResetToken.ts) —
-      // this also means a token can't be replayed after a successful
-      // reset, since that reset itself changes the fingerprint.
-      if (passwordFingerprint(user.passwordHash) !== payload.pwFingerprint) {
-        throw Errors.unauthorized(
-          "This password reset link has already been used. Please request a new one.",
-          "PASSWORD_RESET_ALREADY_USED"
-        );
-      }
-
-      if (!isPasswordStrongEnough(body.password)) {
-        throw Errors.validation("Password must be at least 8 characters and include a letter and a number.");
-      }
-
-      const passwordHash = await hashPassword(body.password);
-      await prisma.user.update({ where: { id: user.id }, data: { passwordHash } });
-
-      // A password reset should immediately kill any already-issued
-      // sessions/JWTs for this account — same reasoning as suspending a
-      // cashier (see PATCH /admin/cashiers/:id/status).
-      await prisma.session.updateMany({
-        where: { userId: user.id, revokedAt: null },
-        data: { revokedAt: new Date() },
-      });
-
-      await recordAudit({
-        action: "PASSWORD_RESET_COMPLETED",
-        actorId: user.id,
-        actorRole: user.role,
-        shopId: user.shopId,
-        entityType: "User",
-        entityId: user.id,
-      });
-
-      return { success: true, data: null, message: "Your password has been reset. You can now log in." };
+    async () => {
+      throw Errors.forbidden(
+        "Password reset links are no longer supported. Please use the new account recovery flow.",
+        "PASSWORD_RESET_DISABLED"
+      );
     }
   );
 

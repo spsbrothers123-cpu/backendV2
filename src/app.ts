@@ -4,6 +4,7 @@ import sensible from "@fastify/sensible";
 import rateLimit from "@fastify/rate-limit";
 import { ZodError } from "zod";
 import { env } from "./config/env.js";
+import { parseTrustProxy } from "./lib/trustProxy.js";
 import { AppError } from "./lib/errors.js";
 import authPlugin from "./plugins/auth.js";
 import healthRoutes from "./routes/health.js";
@@ -36,6 +37,13 @@ import adminProfileRoutes from "./routes/admin/profile.js";
 import adminSearchRoutes from "./routes/admin/search.js";
 import adminSettingsRoutes from "./routes/admin/settings.js";
 import adminConsolidationRoutes from "./routes/admin/consolidation.js";
+import adminUpiRoutes from "./routes/admin/upi.js";
+import adminBranchProductsRoutes from "./routes/admin/branchProducts.js";
+import adminBillsRoutes from "./routes/admin/bills.js";
+import adminSecurityRoutes from "./routes/admin/security.js";
+import adminRecoveryRoutes from "./routes/adminRecovery.js";
+import cashierRecoveryRoutes from "./routes/cashierRecovery.js";
+import adminCashierRecoveryRoutes from "./routes/admin/cashierRecovery.js";
 
 export async function buildApp(): Promise<FastifyInstance> {
   const app = Fastify({
@@ -43,7 +51,9 @@ export async function buildApp(): Promise<FastifyInstance> {
       env.NODE_ENV === "development"
         ? { transport: { target: "pino-pretty", options: { translateTime: "HH:MM:ss", ignore: "pid,hostname" } } }
         : true,
-    trustProxy: true,
+    // NOT `true`: that trusts the client-supplied X-Forwarded-For and lets anyone
+    // spoof request.ip (IP throttle, rate limit, audit trail). See lib/trustProxy.ts.
+    trustProxy: parseTrustProxy(env.TRUST_PROXY, { production: env.NODE_ENV === "production" }),
   });
 
   // ── CORS ────────────────────────────────────────────────────────────
@@ -70,6 +80,10 @@ export async function buildApp(): Promise<FastifyInstance> {
   // ── Routes ──────────────────────────────────────────────────────────
   await app.register(healthRoutes);
   await app.register(authRoutes, { prefix: "/api/auth" });
+  // Admin Forgot Password (passkey / recovery code) — unauthenticated by design.
+  await app.register(adminRecoveryRoutes, { prefix: "/api/auth/admin/recovery" });
+  // Cashier Forgot Password (admin-assisted, in person) — unauthenticated by design.
+  await app.register(cashierRecoveryRoutes, { prefix: "/api/auth/cashier-recovery" });
   await app.register(cashierRequestsRoutes, { prefix: "/api/admin/cashier-requests" });
   await app.register(cashiersRoutes, { prefix: "/api/admin/cashiers" });
   await app.register(adminInvitationCodesRoutes, { prefix: "/api/admin/invitation-codes" });
@@ -98,6 +112,13 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(adminSearchRoutes, { prefix: "/api/admin/search" });
   await app.register(adminSettingsRoutes, { prefix: "/api/admin/settings" });
   await app.register(adminConsolidationRoutes, { prefix: "/api/admin/consolidation" });
+  await app.register(adminUpiRoutes, { prefix: "/api/admin/upi" });
+  await app.register(adminSecurityRoutes, { prefix: "/api/admin/security" });
+  // Central Admin only (CENTRAL_ADMIN_USER_ID) — spans every shop.
+  await app.register(adminCashierRecoveryRoutes, { prefix: "/api/admin/cashier-recovery" });
+  // Central Admin only — per-branch product assignment (Phase 2 Stage 2.2).
+  await app.register(adminBranchProductsRoutes, { prefix: "/api/admin/branch-products" });
+  await app.register(adminBillsRoutes, { prefix: "/api/admin/bills" });
 
   // ── Centralized error handling — every route throws, nothing formats
   // its own error response, so the JSON body shape is consistent everywhere.

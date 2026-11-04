@@ -6,6 +6,7 @@ import type {
   Product,
   Purchase,
   PurchaseItem,
+  PurchaseReversal,
   Expense,
   InventoryMovement,
   CashierSession,
@@ -77,9 +78,19 @@ export function toAdminCustomer(c: {
   };
 }
 
-export function toAdminPurchase(p: Purchase & { items: PurchaseItem[] }): Record<string, unknown> {
+export function toAdminPurchase(
+  p: Purchase & { items: PurchaseItem[]; reversal?: PurchaseReversal | null; shop?: Pick<Shop, "name"> | null }
+): Record<string, unknown> {
   return {
     id: p.id,
+    // Stage 2.6: the explicitly selected receiving branch (immutable).
+    receivingShopId: p.shopId,
+    receivingBranchName: p.shop?.name,
+    // Original status is never rewritten; reversal is a separate linked record.
+    reversed: !!p.reversal,
+    reversal: p.reversal
+      ? { id: p.reversal.id, reason: p.reversal.reason, reversedAt: p.reversal.createdAt.toISOString(), reversedById: p.reversal.reversedById }
+      : null,
     invoiceNumber: p.invoiceNumber,
     supplierName: p.supplierName,
     purchaseDate: p.purchaseDate.toISOString().slice(0, 10),

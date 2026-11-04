@@ -73,6 +73,14 @@ export default async function adminInvitationCodesRoutes(fastify: FastifyInstanc
           codeHash = hashInvitationCode(code);
         }
 
+        // If every retry above collided, `codeHash` still points at a live
+        // code. Refuse to create a duplicate rather than let
+        // validate-by-hash-lookup (routes/auth.ts) match the wrong row.
+        const stillColliding = await tx.invitationCode.findFirst({ where: { codeHash, status: "ACTIVE" } });
+        if (stillColliding) {
+          throw Errors.conflict("Could not generate a unique code. Please try again.", "INVITATION_CODE_COLLISION");
+        }
+
         return tx.invitationCode.create({
           data: {
             codeHash,

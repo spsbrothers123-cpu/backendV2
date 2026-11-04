@@ -93,8 +93,10 @@ export default async function adminSessionsRoutes(fastify: FastifyInstance) {
     const base = toSessionHistoryItem(session, summary);
     const expectedClosingCash = toNumber(session.openingCash) + summary.cashSales;
 
+    // Totals above come from PAID bills only (cancelled sales are excluded
+    // from net sales); the activity feed also lists cancelled ones, labelled.
     const bills = await prisma.bill.findMany({
-      where: { sessionId: session.id, status: "PAID" },
+      where: { sessionId: session.id, status: { in: ["PAID", "CANCELLED"] } },
       orderBy: { createdAt: "asc" },
     });
     const activity = [
@@ -102,7 +104,7 @@ export default async function adminSessionsRoutes(fastify: FastifyInstance) {
       ...bills.map((b) => ({
         id: b.id,
         time: b.createdAt.toISOString(),
-        description: `Sale ${b.billNumber} — ₹${toNumber(b.grandTotal).toFixed(2)}`,
+        description: `Sale ${b.billNumber} — ₹${toNumber(b.grandTotal).toFixed(2)}${b.status === "CANCELLED" ? " (CANCELLED)" : ""}`,
       })),
       ...(session.closedAt
         ? [{ id: `${session.id}-close`, time: session.closedAt.toISOString(), description: "Session closed" }]

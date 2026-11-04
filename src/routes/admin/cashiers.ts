@@ -6,6 +6,7 @@ import { parseBody } from "../../lib/validate.js";
 import { recordAudit } from "../../lib/audit.js";
 import { toPublicCashier } from "../../lib/serializers.js";
 import { listShopsForAdmin } from "../../lib/shopAccess.js";
+import { assertBranchCashierSlotFree, lockBranchCashierSlot } from "../../lib/branchCashier.js";
 
 const emailSchema = z.string().trim().min(1, "Email is required.").email("Enter a valid email address.");
 // Loose on purpose (digits, spaces, +, -, parens) — this isn't an OTP/SMS
@@ -120,10 +121,18 @@ export default async function cashiersRoutes(fastify: FastifyInstance) {
       throw Errors.conflict("Only active or suspended cashiers can have their status changed here.", "INVALID_STATE");
     }
 
-    const updated = await prisma.user.update({
-      where: { id: existing.id },
-      data: { status: body.status },
-      include: { shop: true },
+    // Stage 2.4: re-activating a suspended Cashier must not create a second
+    // Cashier at the branch. Check + change are atomic per branch.
+    const updated = await prisma.$transaction(async (tx) => {
+      if (body.status === "ACTIVE") {
+        await lockBranchCashierSlot(tx, existing.shopId!);
+        await assertBranchCashierSlotFree(tx, existing.shopId!, existing.id);
+      }
+      return tx.user.update({
+        where: { id: existing.id },
+        data: { status: body.status },
+        include: { shop: true },
+      });
     });
 
     // Suspending a cashier should also kill any live sessions immediately —

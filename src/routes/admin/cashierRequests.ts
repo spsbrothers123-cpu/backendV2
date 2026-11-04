@@ -8,6 +8,7 @@ import { sendCashierApproved, sendCashierRejected } from "../../lib/email.js";
 import { listShopsForAdmin, ensureAdminShopLink } from "../../lib/shopAccess.js";
 import { initializeCashierInventory } from "../../services/inventoryService.js";
 import type { AccountStatus, Prisma } from "@prisma/client";
+import { assertBranchCashierSlotFree, assertNoStrandedCashierStock, lockBranchCashierSlot } from "../../lib/branchCashier.js";
 
 const listQuerySchema = z.object({
   status: z.enum(["PENDING_ADMIN_APPROVAL", "REJECTED", "ALL"]).optional(),
@@ -140,6 +141,15 @@ export default async function cashierRequestsRoutes(fastify: FastifyInstance) {
     // the status flip so a cashier is never left ACTIVE without it (or
     // vice versa on a failure).
     const { updated, productsInitialized } = await prisma.$transaction(async (tx) => {
+      // Stage 2.4: never two Cashiers at one branch (legacy data may already
+      // hold an ACTIVE one next to this pending request — the owner decides).
+      await lockBranchCashierSlot(tx, shopId);
+      await assertBranchCashierSlotFree(tx, shopId, target.id);
+      // Before the BranchInventory cutover stock is still cashier-owned, so
+      // approving a REPLACEMENT would leave the branch's stock with the old
+      // Cashier and show the new one an empty shelf — i.e. reset the branch's
+      // visible inventory. Refuse until stock belongs to the branch.
+      await assertNoStrandedCashierStock(tx, shopId, target.id);
       const updatedUser = await tx.user.update({
         where: { id: target.id },
         data: { status: "ACTIVE", approvedAt: new Date(), approvedBy: admin.id },

@@ -1,5 +1,6 @@
 import type { FastifyInstance } from "fastify";
 import { prisma } from "../../lib/prisma.js";
+import { assignedToShop } from "../../lib/branchCatalog.js";
 
 const RESULTS_PER_GROUP = 5;
 
@@ -14,7 +15,7 @@ export default async function adminSearchRoutes(fastify: FastifyInstance) {
 
     const [products, customers, bills] = await Promise.all([
       prisma.product.findMany({
-        where: { shopId: admin.shopId!, name: { contains: q, mode: "insensitive" } },
+        where: { ...assignedToShop(admin.shopId!), name: { contains: q, mode: "insensitive" } },
         take: RESULTS_PER_GROUP,
         orderBy: { name: "asc" },
       }),
