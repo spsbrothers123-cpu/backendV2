@@ -56,6 +56,12 @@ export function toCashierProduct(p: Product, cashierStock?: number, effectivePri
     price: toNumber(effectivePrice ?? p.sellingPrice),
     unit: UNIT_MAP[p.unit] ?? p.unit.toLowerCase(),
     stock: cashierStock ?? p.stock,
+    // Stage 4.4 (additive): the per-product low-stock threshold set by the
+    // central Admin, so the Cashier shows the same Low Stock state as Admin.
+    // 0 means "no low-stock warning". Read-only; never affects stock logic.
+    // Only on LIVE product views (cashierStock supplied, i.e. GET /products);
+    // historical snapshots (bill / held-bill lines) are left unchanged.
+    ...(cashierStock !== undefined ? { lowStockThreshold: p.lowStockThreshold } : {}),
   };
 }
 
