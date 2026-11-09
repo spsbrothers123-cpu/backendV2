@@ -1,0 +1,1270 @@
+// Egg Mart POS — Unified Backend — Phase 1 schema
+// One database, one User table shared by Admin + Cashier roles.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+  shadowDatabaseUrl = env("SHADOW_DATABASE_URL")
+}
+
+enum Role {
+  ADMIN
+  CASHIER
+}
+
+// Conceptual account lifecycle. Admins are created ACTIVE (via seed / another
+// admin); cashiers go straight from signup (gated by an admin-issued
+// invitation code — see InvitationCode) to admin-approval.
+enum AccountStatus {
+  PENDING_ADMIN_APPROVAL
+  ACTIVE
+  REJECTED
+  SUSPENDED
+}
+
+// Lifecycle of an admin-generated 6-digit cashier invitation code.
+enum InvitationCodeStatus {
+  ACTIVE
+  USED
+  EXPIRED
+  REVOKED
+}
+
+enum AuditAction {
+  LOGIN
+  LOGOUT
+  LOGIN_FAILED
+  CASHIER_SIGNUP_REQUESTED
+  CASHIER_APPROVED
+  CASHIER_REJECTED
+  CASHIER_UPDATED
+  CASHIER_STATUS_CHANGED
+  INVITATION_CODE_GENERATED
+  INVITATION_CODE_REVOKED
+  INVITATION_CODE_USED
+
+  // ── Phase 2 ───────────────────────────────────────────
+  // ── Multi-shop foundation (RBR Egg Mart Phase 1) ────────────────────
+  ADMIN_SIGNUP
+  SHOP_CREATED
+  SHOP_LINKED
+  SHOP_SWITCHED
+
+  SESSION_OPENED
+  SESSION_CLOSED
+  PRODUCT_CREATED
+  PRODUCT_UPDATED
+  PRODUCT_DELETED
+  PRODUCT_ASSIGNED
+  PRODUCT_UNASSIGNED
+  PRICE_OVERRIDE_SET
+  PRICE_OVERRIDE_CLEARED
+  CUSTOMER_CREATED
+  CUSTOMER_UPDATED
+  BILL_CREATED
+  BILL_HELD
+  BILL_RESUMED
+  BILL_HELD_DELETED
+  PAYMENT_CREATED
+  SPLIT_PAYMENT_CREATED
+  CREDIT_PAYMENT_CREATED
+  INVENTORY_ADJUSTED
+  PURCHASE_CREATED
+  PURCHASE_REVERSED
+  BILL_CANCELLED
+  EXPENSE_CREATED
+  EXPENSE_UPDATED
+  EXPENSE_DELETED
+  PROFILE_UPDATED
+  SETTINGS_UPDATED
+
+  // ── RBR Egg Mart V2 Phase 1 (this phase) ────────────────────────────
+  PASSWORD_RESET_REQUESTED
+  PASSWORD_RESET_COMPLETED
+
+  // ── UPI Management (Admin UPI configuration) ─────────────────────────
+  UPI_CONFIG_UPDATED
+
+  // ── Cashier admin-assisted password recovery ─────────────────────────
+  CASHIER_RECOVERY_REQUESTED
+  CASHIER_RECOVERY_APPROVED
+  CASHIER_RECOVERY_REJECTED
+  CASHIER_RECOVERY_COMPLETED
+  CASHIER_RECOVERY_FAILED
+  CASHIER_RECOVERY_THROTTLED
+  CASHIER_RECOVERY_DENIED
+}
+
+// ── Phase 2 enums ─────────────────────────────────────────────────────
+
+enum ProductUnit {
+  KG
+  G
+  LITRE
+  ML
+  PIECE
+  TRAY
+  BOX
+}
+
+enum ProductStatus {
+  ACTIVE
+  INACTIVE
+}
+
+enum CashierSessionStatus {
+  OPEN
+  CLOSED
+}
+
+enum BillStatus {
+  HELD
+  PAID
+  CANCELLED
+}
+
+enum PaymentMethod {
+  CASH
+  CARD
+  UPI
+  CREDIT
+}
+
+enum CreditTxnType {
+  CHARGE
+  COLLECTION
+  // Phase 2 Stage 2.7: reverses the CHARGE rows of a cancelled bill. At most
+  // one per bill (partial unique index in the migration).
+  REVERSAL
+}
+
+enum StockMovementType {
+  IN
+  OUT
+  ADJUSTMENT
+}
+
+enum NotificationType {
+  LOW_STOCK
+  PAYMENT_PENDING
+  SESSION_EVENT
+  SYSTEM
+}
+
+enum PurchaseStatus {
+  RECEIVED
+  PENDING
+  CANCELLED
+}
+
+model Shop {
+  id        String   @id @default(uuid())
+  name      String
+  code      String   @unique
+  address   String?
+
+  // Multi-shop foundation (RBR Egg Mart Phase 1): the raw branch/area name
+  // a shop was identified and named from at signup time, e.g. "Veerapandi"
+  // (name then becomes "RBR Egg Mart - Veerapandi" — see
+  // src/lib/shopAccess.ts). Deliberately separate from `address`, which is
+  // the free-text mailing address editable on the Admin Settings page —
+  // two different concepts that happened to share a name in the spec doc.
+  // Nullable: the legacy seeded shop (and any shop created before this
+  // field existed) has no location on file.
+  location  String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  users     User[]
+  auditLogs AuditLog[]
+
+  products         Product[]
+  customers        Customer[]
+  cashierSessions  CashierSession[]
+  bills            Bill[]
+  creditTxns       CreditTransaction[]
+  inventoryMoves   InventoryMovement[]
+  cashierInventories CashierInventory[]
+  // Phase 2 Stage 2.1: branch-level assignment + stock (additive; unused by
+  // application code until Stages 2.2 / 2.3).
+  branchProducts    BranchProduct[]
+  branchInventories BranchInventory[]
+  purchases        Purchase[]
+  expenses         Expense[]
+  billCounters     BillCounter[]
+  notifications    Notification[]
+  settings         ShopSettings?
+  invitationCodes  InvitationCode[]
+
+  // Multi-shop foundation: which Admin(s) own/manage this shop. A row here
+  // is the source of truth for shop access — see AdminShopLink below.
+  adminLinks       AdminShopLink[]
+
+  // UPI Management: per-admin receiving-account settings for this shop.
+  upiShopAccounts  UpiShopAccount[]
+
+  @@map("shops")
+}
+
+// Multi-shop foundation (RBR Egg Mart Phase 1). A single Admin User can own
+// several Shops (one row per admin/shop pair) — this is what makes "Admin A
+// manages Veerapandi, Gandhipuram, and Singanallur" representable, since
+// User.shopId is a single scalar (it's "this account's current/active
+// shop", not the full set they're allowed to access).
+//
+// Existing single-shop admins (seeded, or created before this table
+// existed) have no row here yet. Nothing backfills them via migration —
+// src/lib/shopAccess.ts (assertAdminOwnsShop / listShopsForAdmin) lazily
+// creates the missing link the first time that admin's shop access is
+// checked, falling back to "does user.shopId already equal this shop"
+// during the gap. This keeps the migration purely additive.
+model AdminShopLink {
+  id      String @id @default(uuid())
+  adminId String
+  admin   User   @relation(fields: [adminId], references: [id], onDelete: Cascade)
+  shopId  String
+  shop    Shop   @relation(fields: [shopId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  @@unique([adminId, shopId])
+  @@index([shopId])
+  @@map("admin_shop_links")
+}
+
+// Admin-generated 6-digit cashier signup invitation code. Replaces the old
+// cashier-signup email OTP flow entirely — see routes/auth.ts and
+// routes/admin/invitationCodes.ts. Only one ACTIVE code exists per shop at
+// a time (generating a new one revokes the previous one).
+//
+// The code itself is only ever stored hashed (codeHash, SHA-256) for
+// verification. `codePlain` is a deliberate, narrow exception: the Admin
+// UI needs to re-display the still-valid code after a page refresh
+// (GET /admin/invitation-codes/active), not just at the moment it was
+// generated. So `codePlain` is populated only while status is ACTIVE and
+// is wiped (set back to null) the instant the code stops being ACTIVE
+// (used, revoked, or found expired) — it never leaks through any
+// list/history endpoint, only through the single "current active code"
+// endpoint, and only to the admin of the owning shop.
+model InvitationCode {
+  id     String @id @default(uuid())
+
+  // RBR Egg Mart V2 Phase 1: a code no longer belongs to a shop. It is a
+  // generic "authorized to register as a cashier" grant, scoped to the
+  // admin who created it (createdByAdminId) — never to a shop. The shop a
+  // cashier joins is decided later, at signup, from their own Branch Name
+  // (see src/lib/shopAccess.ts resolveOrCreateShopByLocation and
+  // src/routes/auth.ts POST /signup). Column kept nullable, rather than
+  // dropped, purely so historical rows retain their original shop for
+  // audit purposes — no code path reads or writes it for new codes.
+  shopId String?
+  shop   Shop?   @relation(fields: [shopId], references: [id], onDelete: SetNull)
+
+  codeHash  String
+  codePlain String?
+
+  status    InvitationCodeStatus @default(ACTIVE)
+  expiresAt DateTime
+  usedAt    DateTime?
+
+  createdByAdminId String
+  createdByAdmin   User   @relation("InvitationCodesCreated", fields: [createdByAdminId], references: [id])
+
+  // Set to the cashier User created via this code, once used — lets the
+  // Admin cashier-requests list show a masked reference to which code a
+  // given signup request came from (see User.invitationCodeMasked).
+  usedByUserId String? @unique
+  usedByUser   User?   @relation("InvitationCodeUsedBy", fields: [usedByUserId], references: [id])
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([shopId])
+  @@index([codeHash])
+  @@index([status])
+  @@map("invitation_codes")
+}
+
+// One row per shop, holding everything shown on the Admin app's Settings
+// page. Free-form settings groups (tax/billing, appearance, POS, security)
+// are stored as JSON so new fields can be added there without a migration;
+// the handful of fields the Admin "General" tab treats as core shop
+// identity (gstin, contact info) get real columns.
+model ShopSettings {
+  id     String @id @default(uuid())
+  shopId String @unique
+  shop   Shop   @relation(fields: [shopId], references: [id])
+
+  gstin        String?
+  contactPhone String?
+  contactEmail String?
+
+  taxBilling Json @default("{}")
+  appearance Json @default("{}")
+  pos        Json @default("{}")
+  security   Json @default("{}")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("shop_settings")
+}
+
+// Admin-facing notification feed (low stock alerts, pending credit
+// payments, session open/close events, system messages). Cashier app
+// does not read this model.
+model Notification {
+  id     String           @id @default(uuid())
+  shopId String
+  shop   Shop             @relation(fields: [shopId], references: [id])
+
+  type    NotificationType
+  title   String
+  message String
+  read    Boolean          @default(false)
+
+  createdAt DateTime @default(now())
+
+  @@index([shopId, read, createdAt])
+  @@map("notifications")
+}
+
+model User {
+  id       String @id @default(uuid())
+  name     String
+  email    String @unique
+  phone    String?
+  passwordHash String
+
+  role   Role
+  status AccountStatus @default(ACTIVE)
+
+  shopId String?
+  shop   Shop?   @relation(fields: [shopId], references: [id])
+
+  approvedAt DateTime?
+  approvedBy String?
+  rejectedAt DateTime?
+  rejectedBy String?
+  rejectionReason String?
+
+  lastLoginAt DateTime?
+
+  // Masked reference (e.g. "••••31") to the invitation code a cashier
+  // signed up with — set once, at registration, from InvitationCode.
+  // The full code is never recoverable from this. Null for admins and
+  // for any cashier row created outside the invitation-code flow (e.g.
+  // seeded).
+  invitationCodeMasked String?
+
+  // Phase 2: the branch/location a cashier registered under (collected as
+  // a new required field on the cashier signup form). Nullable at the
+  // schema level — existing cashiers created before this field existed
+  // have no branch on file — but required by the signup endpoint for
+  // every NEW cashier registration (see routes/auth.ts registerSchema).
+  // Null for admins, who aren't tied to a single branch.
+  branchName String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  sessions            Session[]
+  auditLogs           AuditLog[] @relation("ActorAuditLogs")
+  invitationCodesCreated InvitationCode[] @relation("InvitationCodesCreated")
+  invitationCodeUsed     InvitationCode?  @relation("InvitationCodeUsedBy")
+
+  // Multi-shop foundation: every shop this User (in practice, an ADMIN)
+  // owns/manages. Empty for cashiers and for admins not yet self-healed
+  // into the table — see AdminShopLink's doc comment.
+  shopLinks           AdminShopLink[]
+
+  // UPI Management (ADMIN only): the common receiving account and the
+  // per-shop settings this admin owns.
+  upiCommonAccount    UpiCommonAccount?
+  upiShopAccounts     UpiShopAccount[]
+
+  // Admin password recovery (Phase 1 foundation): recovery codes, the
+  // short-lived grants issued after a successful verification, and the
+  // recovery audit/throttle ledger. All keyed to THIS table's id — no
+  // parallel user/auth tables.
+  adminRecoveryCodes  AdminRecoveryCode[]
+  adminRecoveryGrants AdminRecoveryGrant[]
+  adminRecoveryAudits AdminRecoveryAudit[]
+
+  // Admin Security Settings (Phase 2): registered passkeys + the
+  // short-lived WebAuthn registration challenges.
+  adminPasskeys          AdminPasskey[]
+  adminPasskeyChallenges AdminPasskeyChallenge[]
+
+  // Cashier admin-assisted password recovery: requests filed BY this cashier,
+  // and requests decided (approved/rejected) BY this user (the Central Admin).
+  cashierRecoveryRequests         CashierRecoveryRequest[] @relation("CashierRecoveryRequester")
+  cashierRecoveryRequestsDecided  CashierRecoveryRequest[] @relation("CashierRecoveryDecider")
+
+  cashierSessions     CashierSession[]
+  billsAsCashier      Bill[]              @relation("CashierBills")
+  billsCancelled      Bill[]              @relation("BillCancelledBy")
+  inventoryMoves      InventoryMovement[]
+  inventoryMovesAsCashierOwner InventoryMovement[] @relation("InventoryMovementCashier")
+  cashierInventories  CashierInventory[]  @relation("CashierInventoryOwner")
+  customersAsCashier  Customer[]          @relation("CashierCustomers")
+  purchasesCreated    Purchase[]
+  expensesCreated     Expense[]
+  creditTxnsActed     CreditTransaction[]
+
+  @@index([role, status])
+  @@index([shopId])
+  @@map("users")
+}
+
+// Lightweight session record so logout / suspension can revoke an
+// already-issued JWT rather than relying on expiry alone.
+model Session {
+  id     String @id @default(uuid())
+  jti    String @unique
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  userAgent String?
+  ip        String?
+
+  createdAt DateTime  @default(now())
+  expiresAt DateTime
+  revokedAt DateTime?
+
+  @@index([userId])
+  @@map("sessions")
+}
+
+model AuditLog {
+  id     String      @id @default(uuid())
+  action AuditAction
+
+  actorId String?
+  actor   User?   @relation("ActorAuditLogs", fields: [actorId], references: [id])
+  actorRole Role?
+
+  shopId String?
+  shop   Shop?   @relation(fields: [shopId], references: [id])
+
+  entityType String?
+  entityId   String?
+
+  metadata Json?
+
+  createdAt DateTime @default(now())
+
+  @@index([action, createdAt])
+  @@index([actorId])
+  @@map("audit_logs")
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// PHASE 2 — Products, Customers, Sessions, Billing, Payments, Inventory,
+// Purchases, Expenses. One database, shared by Admin + Cashier frontends.
+// ═══════════════════════════════════════════════════════════════════════
+
+model Product {
+  id                String        @id @default(uuid())
+  shopId            String
+  shop              Shop          @relation(fields: [shopId], references: [id])
+
+  name              String
+  category          String
+  sku               String?
+  barcode           String?
+
+  // Money: always NUMERIC, never float — see lib/money.ts.
+  sellingPrice      Decimal       @db.Decimal(12, 2)
+  costPrice         Decimal?      @db.Decimal(12, 2)
+
+  // Cashier-level inventory foundation: this is now a denormalized SUM of
+  // every CashierInventory row for this product, not an independent,
+  // directly-editable number — see CashierInventory's doc comment. Only
+  // adjustStock() writes it, always alongside the matching
+  // CashierInventory change, in the same transaction.
+  stock             Int           @default(0)
+  unit              ProductUnit
+  lowStockThreshold Int           @default(0)
+  status            ProductStatus @default(ACTIVE)
+
+  createdAt         DateTime      @default(now())
+  updatedAt         DateTime      @updatedAt
+
+  billItems         BillItem[]
+  inventoryMoves    InventoryMovement[]
+  cashierInventories CashierInventory[]
+  branchProducts    BranchProduct[]
+  branchInventories BranchInventory[]
+  purchaseItems     PurchaseItem[]
+
+  @@index([shopId, status])
+  @@index([shopId, category])
+  @@unique([shopId, barcode])
+  @@map("products")
+}
+
+// ── Cashier-level inventory foundation (RBR Egg Mart Phase 1 addition) ──
+//
+// The source of truth for "how much of this product does THIS cashier
+// have". Every unit of stock is owned by exactly one (shop, cashier,
+// product) tuple — cashiers never share a pooled shop-wide stock, even
+// when they work the same shop. See src/services/inventoryService.ts
+// (adjustStock) for the single chokepoint that reads/writes this table.
+//
+// Product.stock is kept as a denormalized SUM of every CashierInventory
+// row for that product (updated by the same delta in the same
+// transaction — see adjustStock). It still answers shop-wide questions
+// (Admin KPIs, low-stock alerts, the product catalog list) without
+// re-aggregating on every read, but it is NEVER the number shown to a
+// cashier for their own POS — that always comes from this table, scoped
+// to shopId + cashierId, per the isolation requirement.
+model CashierInventory {
+  id        String   @id @default(uuid())
+  shopId    String
+  shop      Shop     @relation(fields: [shopId], references: [id])
+  cashierId String
+  cashier   User     @relation("CashierInventoryOwner", fields: [cashierId], references: [id])
+  productId String
+  product   Product  @relation(fields: [productId], references: [id])
+
+  quantity  Int      @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // The (shopId, cashierId, productId) triple is the isolation boundary:
+  // one row per cashier per product, never merged across cashiers or
+  // shops (see the migration's data-preservation notes).
+  @@unique([shopId, cashierId, productId])
+  @@index([shopId, cashierId])
+  @@index([productId])
+  @@map("cashier_inventories")
+}
+
+// ── Phase 2 Stage 2.1: Global catalog + branch inventory (ADDITIVE) ───────
+//
+// Target architecture: ONE Central Admin -> branches (Shop rows) -> exactly
+// ONE Cashier per branch. Product rows (existing IDs preserved) become the
+// global catalog; these two tables add per-branch assignment/price and
+// per-branch stock. Nothing in the application reads or writes them yet:
+//   * Stage 2.2 backfills/maintains BranchProduct and switches visibility.
+//   * Stage 2.3 backfills BranchInventory (verified, hard-stop on mismatch)
+//     and moves stock operations onto it after an authorized cutover.
+// Until then CashierInventory stays the live stock source and
+// Product.stock stays the maintained aggregate. Product.shopId remains as
+// legacy origin-shop metadata.
+
+// Which products a branch carries, plus an optional branch price override.
+// A row with isAssigned = false means "hidden from this branch" — it never
+// deletes stock or history (stock lives in BranchInventory and is untouched
+// by (un)assignment). "No row" is a state Stage 2.2 closes by backfilling a
+// row for every shop/product pair; inactive products stay a separate
+// concept (Product.status), distinct from unassigned.
+model BranchProduct {
+  id            String    @id @default(uuid())
+  shopId        String
+  shop          Shop      @relation(fields: [shopId], references: [id])
+  productId     String
+  product       Product   @relation(fields: [productId], references: [id])
+
+  isAssigned    Boolean   @default(true)
+
+  // Optional. Effective price = priceOverride ?? Product.sellingPrice
+  // (Stage 2.5). NUMERIC, never float — see lib/money.ts.
+  priceOverride Decimal?  @db.Decimal(12, 2)
+
+  // Assignment metadata. Actor ids are plain nullable references kept as
+  // audit metadata (no FK) so an account change can never block or cascade
+  // into assignment history.
+  assignedAt    DateTime  @default(now())
+  assignedById  String?
+  unassignedAt  DateTime?
+  unassignedById String?
+
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  @@unique([shopId, productId])
+  @@index([shopId, isAssigned])
+  @@index([productId])
+  @@map("branch_products")
+}
+
+// Authoritative per-branch stock after the approved cutover (Stage 2.3).
+// One row per (branch, product). Product.stock is then the SUM of these
+// rows, maintained in the same transaction. quantity can never go negative
+// (CHECK constraint added in the migration; Prisma cannot express it).
+model BranchInventory {
+  id        String   @id @default(uuid())
+  shopId    String
+  shop      Shop     @relation(fields: [shopId], references: [id])
+  productId String
+  product   Product  @relation(fields: [productId], references: [id])
+
+  quantity  Int      @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([shopId, productId])
+  @@index([productId])
+  @@map("branch_inventories")
+}
+
+// ── Phase 2 Stage 2.3: runtime switches ───────────────────────────────────
+//
+// Tiny key/value table for deliberate, DB-level switches that application
+// code reads inside the same transaction that uses them.
+//
+// key = "inventory_source": which table is the AUTHORITATIVE stock source.
+//   "CASHIER" (default) — legacy: CashierInventory is the source (Stages
+//                         <= 2.2 behaviour, unchanged).
+//   "BRANCH"            — BranchInventory is the source; CashierInventory
+//                         receives no new writes. Flipped ONLY by the
+//                         authorized cutover script (prisma/prepared/
+//                         03_inventory_cutover.sql), atomically with the
+//                         verified backfill — never by application code.
+// Every stock-changing transaction takes a shared row lock on this row;
+// the cutover takes it exclusively, so the switch can never interleave
+// with an in-flight sale, purchase or adjustment.
+model SystemFlag {
+  key       String   @id
+  value     String
+  updatedAt DateTime @default(now()) @updatedAt
+
+  @@map("system_flags")
+}
+
+model Customer {
+  id             String     @id @default(uuid())
+  shopId         String
+  shop           Shop       @relation(fields: [shopId], references: [id])
+
+  // Phase 3 cashier data isolation: which cashier this customer belongs
+  // to. Null for customers created by an Admin (or created before this
+  // column existed) — those remain shop-wide/unassigned rather than
+  // owned by any one cashier. A cashier-created customer is only ever
+  // visible to that cashier (see routes/customers.ts); Admin's Customers
+  // page still reads the whole shop regardless of this column.
+  cashierId      String?
+  cashier        User?      @relation("CashierCustomers", fields: [cashierId], references: [id])
+
+  name           String
+  phone          String
+
+  // Running balance owed by this customer. Increased by CHARGE credit
+  // transactions (credit sales), decreased by COLLECTION transactions.
+  // Always the sum of CreditTransaction rows for this customer — kept as
+  // a denormalized column, updated only inside the same DB transaction
+  // that creates the corresponding CreditTransaction row.
+  creditBalance  Decimal    @default(0) @db.Decimal(12, 2)
+
+  createdAt      DateTime   @default(now())
+  updatedAt      DateTime   @updatedAt
+
+  bills          Bill[]
+  creditTxns     CreditTransaction[]
+
+  @@index([shopId])
+  @@index([shopId, cashierId])
+  // Was @@unique([shopId, phone]) pre-Phase-3: one customer per phone per
+  // shop, full stop. Now scoped per cashier so two cashiers in the same
+  // shop can each independently have "a customer with this phone" without
+  // colliding — that's the isolation Phase 3 asks for. Admin-created rows
+  // (cashierId null) still dedup against each other under Postgres' normal
+  // NULL-is-distinct behavior, which mirrors the old shop-wide constraint
+  // for that one case.
+  @@unique([shopId, cashierId, phone])
+  @@map("customers")
+}
+
+// One row per bill-number sequence bucket (per shop per year). Incremented
+// atomically via a single upsert statement — see lib/billNumber.ts — so
+// concurrent checkouts can never collide on the same bill number.
+model BillCounter {
+  id     String @id @default(uuid())
+  shopId String
+  shop   Shop   @relation(fields: [shopId], references: [id])
+  year   Int
+  seq    Int    @default(0)
+
+  @@unique([shopId, year])
+  @@map("bill_counters")
+}
+
+model CashierSession {
+  id                  String               @id @default(uuid())
+  cashierId           String
+  cashier             User                 @relation(fields: [cashierId], references: [id])
+  shopId              String
+  shop                Shop                 @relation(fields: [shopId], references: [id])
+
+  status              CashierSessionStatus @default(OPEN)
+  openingCash         Decimal              @db.Decimal(12, 2)
+  actualClosingCash   Decimal?             @db.Decimal(12, 2)
+
+  openedAt            DateTime             @default(now())
+  closedAt            DateTime?
+
+  bills               Bill[]
+
+  @@index([cashierId, status])
+  @@index([shopId])
+  @@map("cashier_sessions")
+}
+
+model Bill {
+  id             String         @id @default(uuid())
+  shopId         String
+  shop           Shop           @relation(fields: [shopId], references: [id])
+  cashierId      String
+  cashier        User           @relation("CashierBills", fields: [cashierId], references: [id])
+  sessionId      String?
+  session        CashierSession? @relation(fields: [sessionId], references: [id])
+  customerId     String?
+  customer       Customer?      @relation(fields: [customerId], references: [id])
+
+  billNumber     String?        @unique
+  label          String?
+
+  subtotal       Decimal        @db.Decimal(12, 2)
+  discount       Decimal        @default(0) @db.Decimal(12, 2)
+  tax            Decimal        @default(0) @db.Decimal(12, 2)
+  grandTotal     Decimal        @db.Decimal(12, 2)
+
+  status         BillStatus     @default(HELD)
+
+  // Idempotency: replaying the same key (per shop) returns the original
+  // bill instead of creating a duplicate. Unique so a race between two
+  // identical requests can only ever insert one row.
+  idempotencyKey String?
+
+  createdAt      DateTime       @default(now())
+  heldAt         DateTime?
+  paidAt         DateTime?
+  cancelledAt    DateTime?
+
+  // Phase 2 Stage 2.7 — cancellation record (the bill itself is never
+  // deleted or rewritten; status flips PAID -> CANCELLED exactly once).
+  cancelledById  String?
+  cancelledBy    User?          @relation("BillCancelledBy", fields: [cancelledById], references: [id])
+  cancelReason   String?
+  // True when the bill belonged to an already-CLOSED cashier session.
+  cancelledAfterSessionClose Boolean @default(false)
+
+  items          BillItem[]
+  payments       Payment[]
+  creditTxns     CreditTransaction[]
+
+  @@unique([shopId, idempotencyKey])
+  @@index([shopId, status, createdAt])
+  @@index([cashierId])
+  @@index([customerId])
+  @@map("bills")
+}
+
+model BillItem {
+  id          String   @id @default(uuid())
+  billId      String
+  bill        Bill     @relation(fields: [billId], references: [id], onDelete: Cascade)
+  productId   String
+  product     Product  @relation(fields: [productId], references: [id])
+
+  // Snapshot the product's name/unit/price at time of sale so historical
+  // bills never change if the product is later renamed or re-priced.
+  productName String
+  unit        String
+  quantity    Int
+  unitPrice   Decimal  @db.Decimal(12, 2)
+  lineTotal   Decimal  @db.Decimal(12, 2)
+
+  @@index([billId])
+  @@map("bill_items")
+}
+
+model Payment {
+  id            String        @id @default(uuid())
+  billId        String
+  bill          Bill          @relation(fields: [billId], references: [id], onDelete: Cascade)
+
+  method        PaymentMethod
+  amount        Decimal       @db.Decimal(12, 2)
+  reference     String?
+  cashReceived  Decimal?      @db.Decimal(12, 2)
+  change        Decimal?      @db.Decimal(12, 2)
+
+  createdAt     DateTime      @default(now())
+
+  @@index([billId])
+  @@map("payments")
+}
+
+// One row per credit charge (a CREDIT-method bill) and per collection
+// (partial/full payment against outstanding balance). customer.creditBalance
+// is the running total; this table is the append-only ledger behind it.
+model CreditTransaction {
+  id         String        @id @default(uuid())
+  shopId     String
+  shop       Shop          @relation(fields: [shopId], references: [id])
+  customerId String
+  customer   Customer      @relation(fields: [customerId], references: [id])
+  billId     String?
+  bill       Bill?         @relation(fields: [billId], references: [id])
+
+  type       CreditTxnType
+  amount     Decimal       @db.Decimal(12, 2)
+  method     PaymentMethod?
+  reference  String?
+  notes      String?
+
+  actorId    String?
+  actor      User?         @relation(fields: [actorId], references: [id])
+
+  createdAt  DateTime      @default(now())
+
+  @@index([customerId, createdAt])
+  @@index([shopId])
+  @@map("credit_transactions")
+}
+
+model InventoryMovement {
+  id            String            @id @default(uuid())
+  shopId        String
+  shop          Shop              @relation(fields: [shopId], references: [id])
+  productId     String
+  product       Product           @relation(fields: [productId], references: [id])
+
+  // Cashier-level inventory foundation: whose CashierInventory row this
+  // movement changed. previousStock/newStock below are that cashier's
+  // quantity, not a shop-wide total. Nullable only because rows written
+  // before this column existed have no cashier on file; every new
+  // movement always sets it (adjustStock requires a cashierId).
+  cashierId     String?
+  cashier       User?             @relation("InventoryMovementCashier", fields: [cashierId], references: [id])
+
+  type          StockMovementType
+  // Signed delta: positive for IN/increase, negative for OUT/decrease.
+  quantity      Int
+  previousStock Int
+  newStock      Int
+  reason        String
+
+  // Who performed the action (a cashier selling, or an admin recording a
+  // purchase/adjustment on a cashier's behalf) — distinct from cashierId
+  // above when an admin acts on a cashier's inventory.
+  actorId       String?
+  actor         User?             @relation(fields: [actorId], references: [id])
+
+  createdAt     DateTime          @default(now())
+
+  @@index([shopId, createdAt])
+  @@index([productId])
+  @@index([cashierId])
+  @@map("inventory_movements")
+}
+
+model Purchase {
+  id            String         @id @default(uuid())
+  shopId        String
+  shop          Shop           @relation(fields: [shopId], references: [id])
+
+  supplierName  String
+  invoiceNumber String
+  purchaseDate  DateTime
+
+  subtotal      Decimal        @db.Decimal(12, 2)
+  tax           Decimal        @default(0) @db.Decimal(12, 2)
+  grandTotal    Decimal        @db.Decimal(12, 2)
+  status        PurchaseStatus @default(RECEIVED)
+
+  createdById   String?
+  createdBy     User?          @relation(fields: [createdById], references: [id])
+
+  createdAt     DateTime       @default(now())
+
+  items         PurchaseItem[]
+
+  // Stage 2.6: `shopId` above IS the explicitly selected RECEIVING branch
+  // (stock went only there). It is immutable after creation — enforced by a
+  // DB trigger. Corrections are made with a linked reversal, never by
+  // editing the branch. At most one reversal per purchase (unique).
+  reversal      PurchaseReversal?
+
+  @@index([shopId, createdAt])
+  @@map("purchases")
+}
+
+// Stage 2.6: linked reversal record for a completed purchase. The original
+// purchase and its items are never modified or deleted. Creating this row
+// and the negative stock movements happens in ONE transaction; the unique
+// purchaseId makes a double (or concurrent) reversal impossible.
+model PurchaseReversal {
+  id           String   @id @default(uuid())
+  purchaseId   String   @unique
+  purchase     Purchase @relation(fields: [purchaseId], references: [id])
+  reason       String
+  // Plain audit metadata (no FK), same pattern as BranchProduct.assignedById.
+  reversedById String?
+  createdAt    DateTime @default(now())
+
+  @@map("purchase_reversals")
+}
+
+model PurchaseItem {
+  id            String      @id @default(uuid())
+  purchaseId    String
+  purchase      Purchase    @relation(fields: [purchaseId], references: [id], onDelete: Cascade)
+
+  // Nullable = the Phase 2 "purchase-only item" discriminator. Present ->
+  // this line references a real, permanent Product Catalog row (Option 1,
+  // "Add Product in Catalog"). Null -> this line was added via Option 2,
+  // "Add to Purchase List — Not in Catalog": it exists only on this
+  // purchase, never became a Product row, never touches inventory, and is
+  // never visible to Cashier POS or the Product Catalog. See
+  // routes/admin/purchases.ts.
+  productId     String?
+  product       Product?    @relation(fields: [productId], references: [id])
+
+  // Always populated (for both catalog and purchase-only items) so this
+  // row is a self-contained snapshot — Purchase History, Purchase Details,
+  // and Purchase Export read these columns directly and never need to
+  // join Product, so they keep working unchanged for both item kinds and
+  // never break if a catalog product is later renamed.
+  productName   String
+  quantity      Int
+  unit          ProductUnit
+  purchasePrice Decimal     @db.Decimal(12, 2)
+  total         Decimal     @db.Decimal(12, 2)
+
+  @@index([purchaseId])
+  @@index([productId])
+  @@map("purchase_items")
+}
+
+model Expense {
+  id          String   @id @default(uuid())
+  shopId      String
+  shop        Shop     @relation(fields: [shopId], references: [id])
+
+  date        DateTime
+  category    String
+  description String
+  amount      Decimal  @db.Decimal(12, 2)
+
+  createdById String?
+  createdBy   User?    @relation(fields: [createdById], references: [id])
+
+  createdAt   DateTime @default(now())
+
+  @@index([shopId, date])
+  @@map("expenses")
+}
+
+// ── UPI Management ───────────────────────────────────────────────────────
+// Where a shop's customers' UPI payments are received. Configuration only —
+// no payment, bill or reference data lives here, and nothing in these
+// tables ever marks a payment as received or verified.
+
+enum UpiAccountMode {
+  COMMON
+  CUSTOM
+}
+
+/// One common receiving account per Admin; the fallback for every shop that
+/// Admin is authorized for.
+model UpiCommonAccount {
+  id        String   @id @default(uuid())
+  adminId   String   @unique
+  admin     User     @relation(fields: [adminId], references: [id], onDelete: Cascade)
+
+  /// Stored trimmed + lower-cased (UPI IDs are compared case-insensitively).
+  upiId     String
+  payeeName String
+  enabled   Boolean  @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("upi_common_accounts")
+}
+
+/// Per (Admin, shop) settings. Keyed by BOTH because a shop can be linked
+/// to several Admins (AdminShopLink is many-to-many) and one Admin's
+/// settings must never overwrite or reveal another's.
+model UpiShopAccount {
+  id        String         @id @default(uuid())
+  adminId   String
+  admin     User           @relation(fields: [adminId], references: [id], onDelete: Cascade)
+  shopId    String
+  shop      Shop           @relation(fields: [shopId], references: [id], onDelete: Cascade)
+
+  mode      UpiAccountMode @default(COMMON)
+
+  /// Custom account details. Retained (dormant) while mode = COMMON and
+  /// never used for resolution in that mode.
+  customUpiId     String?
+  customPayeeName String?
+  customEnabled   Boolean  @default(false)
+
+  createdAt DateTime       @default(now())
+  updatedAt DateTime       @updatedAt
+
+  @@unique([adminId, shopId])
+  @@index([shopId])
+  @@map("upi_shop_accounts")
+}
+
+// ── Admin password recovery (Phase 1 foundation) ───────────────────────
+// Recovery codes only for now; passkeys are intentionally NOT modelled yet
+// (they wait on the production-domain decision). All three tables are
+// server-only: the migration enables RLS with no policies and revokes the
+// Supabase `anon` / `authenticated` roles, so nothing here is reachable
+// through the Supabase Data API — only through this backend.
+
+enum AdminRecoveryMethod {
+  RECOVERY_CODE
+  PASSKEY
+}
+
+enum AdminRecoveryEvent {
+  CODES_GENERATED
+  CODES_REGENERATED
+  CODE_VERIFICATION
+  GRANT_ISSUED
+  GRANT_CONSUMED
+  ATTEMPT_THROTTLED
+  // Phase 2 — Admin Security Settings
+  REAUTH_FAILED
+  PASSKEY_REGISTERED
+  PASSKEY_REGISTRATION_FAILED
+  PASSKEY_REMOVED
+  // Phase 3 — Forgot Password flow
+  PASSKEY_VERIFICATION
+  PASSWORD_RECOVERED
+  // Phase 5 — operator-performed ownership recovery (docs/ADMIN_OWNERSHIP_RECOVERY.md)
+  MANUAL_OWNERSHIP_RECOVERY
+}
+
+enum AdminRecoveryOutcome {
+  SUCCESS
+  FAILURE
+}
+
+/// One row per emergency recovery code. Only a keyed hash (HMAC-SHA256,
+/// see lib/recoveryCodes.ts) is stored — never the raw code. A code is
+/// usable while usedAt and revokedAt are both null.
+model AdminRecoveryCode {
+  id     String @id @default(uuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  /// Groups the 8 codes created together; regeneration revokes the whole
+  /// previous set.
+  setId    String
+  codeHash String
+
+  usedAt    DateTime?
+  revokedAt DateTime?
+  createdAt DateTime  @default(now())
+
+  @@unique([userId, codeHash])
+  @@index([userId, setId])
+  @@map("admin_recovery_codes")
+}
+
+/// Short-lived, single-purpose authorization issued after a recovery
+/// credential has been verified. Opaque random token — only its SHA-256 is
+/// stored. Consumed atomically (consumedAt) so it can never be replayed.
+model AdminRecoveryGrant {
+  id     String @id @default(uuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  method    AdminRecoveryMethod
+  tokenHash String              @unique
+  /// SHA-256 of the User-Agent the grant was issued to; a different client
+  /// cannot redeem it (recovery-session hijack mitigation).
+  userAgentHash String
+  expiresAt     DateTime
+  consumedAt    DateTime?
+  createdAt     DateTime            @default(now())
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("admin_recovery_grants")
+}
+
+/// Append-only recovery audit trail AND the durable throttle ledger
+/// (CODE_VERIFICATION + FAILURE rows are what lib/recoveryThrottle.ts
+/// counts). userId is nullable: attempts against unknown emails must be
+/// recordable without revealing anything — those rows are keyed by
+/// subjectHash (a keyed hash of the email; the raw email is never stored
+/// here). Never put codes, tokens or passwords in metadata.
+model AdminRecoveryAudit {
+  id     String  @id @default(uuid())
+  userId String?
+  user   User?   @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  subjectHash String?
+  event       AdminRecoveryEvent
+  outcome     AdminRecoveryOutcome
+  method      AdminRecoveryMethod?
+
+  ip        String?
+  userAgent String?
+  metadata  Json?
+  createdAt DateTime @default(now())
+
+  @@index([subjectHash, createdAt])
+  @@index([ip, createdAt])
+  @@index([userId, createdAt])
+  @@map("admin_recovery_audit")
+}
+
+// ── Admin Security Settings (Phase 2): passkeys ────────────────────────
+// Same lock-down as the Phase 1 tables (RLS, no policies, anon/authenticated
+// revoked): reachable only through this backend.
+
+enum AdminPasskeyChallengePurpose {
+  REGISTRATION
+}
+
+/// One row per registered WebAuthn credential. Holds the PUBLIC key only —
+/// private keys and biometric data never leave the authenticator.
+model AdminPasskey {
+  id     String @id @default(uuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  /// base64url credential ID, globally unique (a credential can belong to
+  /// exactly one account).
+  credentialId String @unique
+  publicKey    Bytes
+  /// Signature counter (WebAuthn uint32 → BIGINT), advanced on every successful assertion.
+  counter      BigInt @default(0)
+  transports   String[]
+  /// "singleDevice" | "multiDevice"
+  deviceType   String
+  backedUp     Boolean
+
+  /// WebAuthn user handle (opaque random, not PII). Identical for every
+  /// passkey of one account.
+  userHandle String
+  /// Admin-chosen label, e.g. "Shop laptop (Windows Hello)".
+  name       String
+
+  createdAt  DateTime  @default(now())
+  lastUsedAt DateTime?
+
+  @@index([userId])
+  @@map("admin_passkeys")
+}
+
+/// A registration challenge issued to an authenticated Admin. Single-use
+/// (consumedAt is set atomically) and short-lived.
+model AdminPasskeyChallenge {
+  id     String @id @default(uuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  purpose    AdminPasskeyChallengePurpose
+  challenge  String
+  /// The user handle that will be stored if this registration succeeds.
+  userHandle String
+  expiresAt  DateTime
+  consumedAt DateTime?
+  createdAt  DateTime @default(now())
+
+  @@index([userId, purpose])
+  @@index([expiresAt])
+  @@map("admin_passkey_challenges")
+}
+
+// ── Admin password recovery (Phase 3): unauthenticated passkey ceremony ─
+// Same lock-down as the other recovery tables (RLS, no policies, anon /
+// authenticated revoked). Deliberately has NO foreign key to users: a
+// challenge is issued for ANY submitted email (known or not) so the
+// response never reveals whether an Admin account exists. It is bound to
+// the keyed hash of that email and to the requesting User-Agent.
+
+/// A WebAuthn authentication challenge issued during Forgot Password.
+/// Single-use (consumedAt is set atomically) and short-lived.
+model AdminRecoveryChallenge {
+  id            String    @id @default(uuid())
+  /// hashRecoverySubject(email) — never the raw email.
+  subjectHash   String
+  /// SHA-256 of the User-Agent the challenge was issued to.
+  userAgentHash String
+  challenge     String
+  expiresAt     DateTime
+  consumedAt    DateTime?
+  createdAt     DateTime  @default(now())
+
+  @@index([subjectHash])
+  @@index([expiresAt])
+  @@map("admin_recovery_challenges")
+}
+
+// ── Cashier admin-assisted password recovery ───────────────────────────
+// One row per recovery request. NO email OTP / reset link is involved: the
+// Cashier files a request, the Central Admin verifies them IN PERSON, and the
+// backend then issues a one-time recovery code that is shown only to that
+// Admin and handed over directly.
+//
+// - expiresAt is fixed at createdAt + 15 minutes (enforced by a CHECK
+//   constraint in the migration) and is never moved by approval.
+// - Only a keyed hash of the code is stored (HMAC-SHA256, lib/cashierRecovery.ts);
+//   it is cleared as soon as the request leaves APPROVED.
+// - The migration also adds a PARTIAL UNIQUE INDEX
+//   (userId) WHERE status IN ('PENDING','APPROVED') — at most one active
+//   request per cashier. Prisma cannot model partial indexes, so it lives in
+//   SQL only; do not delete it when squashing migrations.
+// - Server-only table: RLS on, no policies, anon/authenticated revoked.
+
+enum CashierRecoveryStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  EXPIRED
+  COMPLETED
+}
+
+model CashierRecoveryRequest {
+  id     String @id @default(uuid())
+  userId String
+  user   User   @relation("CashierRecoveryRequester", fields: [userId], references: [id], onDelete: Cascade)
+
+  status CashierRecoveryStatus @default(PENDING)
+
+  createdAt  DateTime  @default(now())
+  expiresAt  DateTime
+  approvedAt DateTime?
+  rejectedAt DateTime?
+
+  decidedById String?
+  decidedBy   User?   @relation("CashierRecoveryDecider", fields: [decidedById], references: [id], onDelete: SetNull)
+
+  /// HMAC-SHA256 hex. Non-null only while status = APPROVED.
+  codeHash       String?
+  /// Wrong codes tried against this request (observability only — brute force is
+  /// stopped by the durable per-account/per-IP throttle, and a hard lockout here
+  /// would let a stranger burn an Admin-approved code).
+  failedAttempts Int       @default(0)
+  consumedAt     DateTime?
+  completedAt    DateTime?
+
+  ip        String?
+  userAgent String?
+
+  @@index([userId, createdAt])
+  @@index([status, expiresAt])
+  @@index([ip, createdAt])
+  @@map("cashier_recovery_requests")
+}
