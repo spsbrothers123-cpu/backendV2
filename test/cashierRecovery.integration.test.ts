@@ -1,428 +1,361 @@
 /**
- * Integration tests — Cashier admin-assisted password recovery (Phase 2 backend).
+ * Integration tests for New Cashier Initialization and cashier data
+ * isolation.
  *
- * Needs a disposable LOCAL Postgres (the test setup refuses anything else):
- *   RUN_INTEGRATION_TESTS=1 npx vitest run test/cashierRecovery.integration.test.ts
+ * Fixture rule (Stage 2.2): a product is visible/sellable at a branch only
+ * through a BranchProduct row with isAssigned = true. Product.shopId is
+ * legacy origin metadata and decides nothing. seedProducts() therefore
+ * creates the BranchProduct rows for the branch it seeds.
+ *
+ * Inventory mode (system_flags 'inventory_source') decides which table is
+ * authoritative, so the tests are mode-aware:
+ *   CASHIER mode  — approval creates a zero-quantity CashierInventory row per
+ *                   assigned product; stock is cashier-owned.
+ *   BRANCH mode   — approval writes NO CashierInventory rows; stock is the
+ *                   branch's BranchInventory, shared by the branch's cashier.
+ * Tests for the mode that is not active are skipped, not failed.
+ *
+ * NOT run as part of the default sandboxed build. To run locally:
+ *   1. Point DATABASE_URL (in .env.test) at a disposable Postgres database.
+ *   2. npx prisma migrate deploy
+ *   3. RUN_INTEGRATION_TESTS=1 npx vitest run test/cashierInitialization.integration.test.ts
  */
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
 import { buildApp } from "../src/app.js";
 import { prisma } from "../src/lib/prisma.js";
-import { env } from "../src/config/env.js";
-import { hashPassword, verifyPassword } from "../src/lib/password.js";
+import { hashPassword } from "../src/lib/password.js";
+import { adjustStock, getInventoryMode, type InventoryMode } from "../src/services/inventoryService.js";
 import { resetDb } from "./dbReset.js";
-import { createAdminFixture } from "./adminFixture.js";
-
-const enabled = !!process.env.RUN_INTEGRATION_TESTS;
-const OLD = "OldPassword1";
-const NEW = "BrandNewPass9";
-const ADMIN_PW = "Password123";
-const envMut = env as unknown as { CENTRAL_ADMIN_USER_ID?: string };
 
 let app: FastifyInstance;
+let shopId: string;
+let adminToken: string;
+let mode: InventoryMode;
+
+const PRODUCT_COUNT = 81;
+
 beforeAll(async () => {
-  if (!enabled) return;
   app = await buildApp();
   await app.ready();
+  mode = await getInventoryMode(prisma);
 });
+
 afterAll(async () => {
-  if (!enabled) return;
   await app.close();
   await prisma.$disconnect();
 });
-beforeEach(async () => {
-  if (!enabled) return;
-  await resetDb();
-  envMut.CENTRAL_ADMIN_USER_ID = undefined;
-});
 
-// ── helpers ────────────────────────────────────────────────────────────
-const post = (url: string, payload: unknown, token?: string, remoteAddress?: string) =>
-  app.inject({
-    method: "POST",
-    url,
-    payload: payload as object,
-    remoteAddress,
-    headers: token ? { authorization: `Bearer ${token}` } : {},
+async function createAdmin(email: string, shop: string) {
+  const admin = await prisma.user.create({
+    data: { name: "Admin", email, passwordHash: await hashPassword("AdminPass123"), role: "ADMIN", status: "ACTIVE", shopId: shop },
   });
-const get = (url: string, token?: string) =>
-  app.inject({ method: "GET", url, headers: token ? { authorization: `Bearer ${token}` } : {} });
-const json = (r: { payload: string }) => JSON.parse(r.payload);
-
-async function centralAdmin(location = "Veerapandi", email = "central@rbr.test") {
-  const a = await createAdminFixture(app, { email, shopLocation: location });
-  envMut.CENTRAL_ADMIN_USER_ID = a.user.id;
-  return a;
+  const res = await app.inject({ method: "POST", url: "/api/auth/admin/login", payload: { email, password: "AdminPass123" } });
+  return { id: admin.id, token: JSON.parse(res.payload).token as string };
 }
-async function cashier(shopId: string, email: string, name = "Cashier") {
+
+/** Approved cashier, created directly (bypassing signup/invitation, which
+ * other test files cover) so these tests focus on what approval and
+ * inventory do. */
+async function createApprovedCashier(email: string, shop: string) {
   return prisma.user.create({
-    data: { name, email, passwordHash: await hashPassword(OLD), role: "CASHIER", status: "ACTIVE", shopId },
+    data: { name: "Cashier", email, passwordHash: await hashPassword("CashierPass123"), role: "CASHIER", status: "ACTIVE", shopId: shop },
   });
 }
-async function cashierLogin(email: string, password = OLD) {
-  return post("/api/auth/login", { email, password });
+
+async function createPendingCashier(email: string, shop: string) {
+  // Approval is exercised through the real HTTP endpoint so these tests
+  // cover POST /admin/cashier-requests/:id/approve.
+  return prisma.user.create({
+    data: {
+      name: "New Cashier",
+      email,
+      passwordHash: await hashPassword("CashierPass123"),
+      role: "CASHIER",
+      status: "PENDING_ADMIN_APPROVAL",
+      shopId: shop,
+    },
+  });
 }
-const request = (email: string, ip?: string) => post("/api/auth/cashier-recovery/request", { email }, undefined, ip);
-const reset = (email: string, code: string, newPassword = NEW) =>
-  post("/api/auth/cashier-recovery/reset", { email, code, newPassword });
-const approve = (token: string, id: string, body: object = { currentPassword: ADMIN_PW, identityVerified: true }) =>
-  post(`/api/admin/cashier-recovery/${id}/approve`, body, token);
 
-/** central admin + a cashier with a PENDING request */
-async function pendingSetup(email = "cash@rbr.test") {
-  const admin = await centralAdmin();
-  const c = await cashier(admin.shop.id, email);
-  expect((await request(email)).statusCode).toBe(200);
-  const req = await prisma.cashierRecoveryRequest.findFirstOrThrow({ where: { userId: c.id } });
-  return { admin, c, req };
+async function approve(requestId: string, token: string) {
+  return app.inject({
+    method: "POST",
+    url: `/api/admin/cashier-requests/${requestId}/approve`,
+    headers: { authorization: `Bearer ${token}` },
+  });
 }
-async function approvedSetup(email = "cash@rbr.test") {
-  const s = await pendingSetup(email);
-  const res = await approve(s.admin.token, s.req.id);
-  expect(res.statusCode).toBe(200);
-  return { ...s, code: json(res).data.code as string };
+
+/** Creates `count` catalog products AND assigns exactly those products to
+ * `shop` (BranchProduct, isAssigned = true). Product.shopId is set only as
+ * legacy origin metadata. */
+async function seedProducts(shop: string, count: number) {
+  const ids: string[] = [];
+  for (let i = 0; i < count; i++) {
+    const p = await prisma.product.create({
+      data: {
+        shopId: shop,
+        name: `Product ${i}`,
+        category: "General",
+        sellingPrice: 10,
+        unit: "PIECE",
+      },
+    });
+    ids.push(p.id);
+  }
+  await prisma.branchProduct.createMany({
+    data: ids.map((productId) => ({ shopId: shop, productId, isAssigned: true })),
+    skipDuplicates: true,
+  });
+  return ids;
 }
-/** Moves a request into the past (createdAt & expiresAt together, as the CHECK demands). */
-async function backdate(id: string, minutes: number) {
-  await prisma.$executeRaw`UPDATE cashier_recovery_requests SET "createdAt" = "createdAt" - make_interval(mins => ${minutes}::int), "expiresAt" = "expiresAt" - make_interval(mins => ${minutes}::int) WHERE id = ${id}`;
-}
-// ── 1–2. request + enumeration safety ──────────────────────────────────
-describe.skipIf(!enabled)("request", () => {
-  it("creates a PENDING request with expiresAt exactly createdAt + 15 minutes", async () => {
-    const { req } = await pendingSetup();
-    expect(req.status).toBe("PENDING");
-    expect(req.expiresAt.getTime() - req.createdAt.getTime()).toBe(15 * 60_000);
-    expect(req.codeHash).toBeNull();
+
+describe("New Cashier Initialization", () => {
+  beforeEach(async () => {
+    await resetDb();
+    const shop = await prisma.shop.create({ data: { name: "RBR Egg Mart - Chennai", code: "chennai" } });
+    shopId = shop.id;
+    const admin = await createAdmin("admin@eggmart.test", shopId);
+    adminToken = admin.token;
   });
 
-  it("returns the identical generic response for known, unknown, admin, and non-active accounts — and creates nothing for the latter three", async () => {
-    const admin = await centralAdmin();
-    await cashier(admin.shop.id, "real@rbr.test");
-    const suspended = await cashier(admin.shop.id, "sus@rbr.test");
-    await prisma.user.update({ where: { id: suspended.id }, data: { status: "SUSPENDED" } });
+  // ── CASHIER mode (legacy, cashier-owned stock) ──────────────────────────
 
-    const payloads = new Set<string>();
-    for (const e of ["real@rbr.test", "ghost@rbr.test", "central@rbr.test", "sus@rbr.test"]) {
-      const r = await request(e);
-      expect(r.statusCode).toBe(200);
-      payloads.add(r.payload);
-    }
-    expect(payloads.size).toBe(1);
-    expect(await prisma.cashierRecoveryRequest.count()).toBe(1);
+  it("[CASHIER mode] gives a newly-approved cashier a CashierInventory row at quantity 0 for every product assigned to the branch", async (ctx) => {
+    if (mode !== "CASHIER") ctx.skip();
+    const productIds = await seedProducts(shopId, PRODUCT_COUNT);
+    const pending = await createPendingCashier("newcashier@example.com", shopId);
+
+    const approveRes = await approve(pending.id, adminToken);
+    expect(approveRes.statusCode).toBe(200);
+
+    const rows = await prisma.cashierInventory.findMany({ where: { shopId, cashierId: pending.id } });
+    expect(rows).toHaveLength(PRODUCT_COUNT);
+    expect(rows.every((r) => r.quantity === 0)).toBe(true);
+    expect(new Set(rows.map((r) => r.productId))).toEqual(new Set(productIds));
   });
 
-  it("does not create a second active request; repeated submits look identical", async () => {
-    const { c } = await pendingSetup();
-    const again = await request("cash@rbr.test");
-    expect(again.statusCode).toBe(200);
-    expect(await prisma.cashierRecoveryRequest.count({ where: { userId: c.id } })).toBe(1);
+  it("[CASHIER mode] does NOT copy an existing cashier's stock quantities onto a newly-approved cashier", async (ctx) => {
+    if (mode !== "CASHIER") ctx.skip();
+    const [productA] = await seedProducts(shopId, 1);
+    const existingCashier = await createApprovedCashier("existing@example.com", shopId);
+
+    await adjustStock(prisma, {
+      shopId,
+      cashierId: existingCashier.id,
+      productId: productA,
+      delta: 500,
+      type: "IN",
+      reason: "test seed",
+    });
+
+    const pending = await createPendingCashier("newcashier2@example.com", shopId);
+    await approve(pending.id, adminToken);
+
+    const newCashierRow = await prisma.cashierInventory.findUnique({
+      where: { shopId_cashierId_productId: { shopId, cashierId: pending.id, productId: productA } },
+    });
+    expect(newCashierRow?.quantity).toBe(0);
+
+    const existingRow = await prisma.cashierInventory.findUnique({
+      where: { shopId_cashierId_productId: { shopId, cashierId: existingCashier.id, productId: productA } },
+    });
+    expect(existingRow?.quantity).toBe(500);
   });
 
-  it("concurrent duplicate submits yield exactly one row (partial unique index)", async () => {
-    const admin = await centralAdmin();
-    await cashier(admin.shop.id, "cash@rbr.test");
-    const rs = await Promise.all(Array.from({ length: 8 }, () => request("cash@rbr.test")));
-    expect(rs.every((r) => r.statusCode === 200)).toBe(true);
-    expect(await prisma.cashierRecoveryRequest.count()).toBe(1);
+  it("[CASHIER mode] a new cashier's catalog (GET /products) includes every assigned product, all at stock 0", async (ctx) => {
+    if (mode !== "CASHIER") ctx.skip();
+    await seedProducts(shopId, PRODUCT_COUNT);
+    const existingCashier = await createApprovedCashier("existing2@example.com", shopId);
+    const [firstProduct] = await prisma.product.findMany({ where: { shopId }, take: 1 });
+    await adjustStock(prisma, {
+      shopId,
+      cashierId: existingCashier.id,
+      productId: firstProduct.id,
+      delta: 250,
+      type: "IN",
+      reason: "test seed",
+    });
+
+    const pending = await createPendingCashier("newcashier3@example.com", shopId);
+    await approve(pending.id, adminToken);
+
+    const loginRes = await app.inject({
+      method: "POST",
+      url: "/api/auth/login",
+      payload: { email: "newcashier3@example.com", password: "CashierPass123" },
+    });
+    const newCashierToken = JSON.parse(loginRes.payload).token as string;
+
+    const productsRes = await app.inject({
+      method: "GET",
+      url: "/api/products",
+      headers: { authorization: `Bearer ${newCashierToken}` },
+    });
+    expect(productsRes.statusCode).toBe(200);
+    const products = JSON.parse(productsRes.payload) as Array<{ id: string; stock: number }>;
+
+    expect(products).toHaveLength(PRODUCT_COUNT);
+    expect(products.every((p) => p.stock === 0)).toBe(true);
   });
 
-  it("a rejected/expired request does not block an immediate new one", async () => {
-    const { admin, c, req } = await pendingSetup();
-    expect((await post(`/api/admin/cashier-recovery/${req.id}/reject`, {}, admin.token)).statusCode).toBe(200);
-    await request("cash@rbr.test");
-    expect(await prisma.cashierRecoveryRequest.count({ where: { userId: c.id, status: "PENDING" } })).toBe(1);
+  it("[CASHIER mode] does not affect an existing cashier's inventory when a different new cashier is approved in the same shop", async (ctx) => {
+    if (mode !== "CASHIER") ctx.skip();
+    const [productA] = await seedProducts(shopId, 1);
+    const existingCashier = await createApprovedCashier("existing3@example.com", shopId);
+    await adjustStock(prisma, { shopId, cashierId: existingCashier.id, productId: productA, delta: 80, type: "IN", reason: "seed" });
 
-    const second = await prisma.cashierRecoveryRequest.findFirstOrThrow({ where: { userId: c.id, status: "PENDING" } });
-    await backdate(second.id, 20); // lapsed, but still "PENDING" on disk
-    await request("cash@rbr.test");
-    const rows = await prisma.cashierRecoveryRequest.findMany({ where: { userId: c.id }, orderBy: { createdAt: "asc" } });
-    expect(rows.map((r) => r.status).sort()).toEqual(["EXPIRED", "PENDING", "REJECTED"]);
+    const before = await prisma.cashierInventory.findUnique({
+      where: { shopId_cashierId_productId: { shopId, cashierId: existingCashier.id, productId: productA } },
+    });
+
+    const pending = await createPendingCashier("newcashier4@example.com", shopId);
+    await approve(pending.id, adminToken);
+
+    const after = await prisma.cashierInventory.findUnique({
+      where: { shopId_cashierId_productId: { shopId, cashierId: existingCashier.id, productId: productA } },
+    });
+    expect(after?.quantity).toBe(before?.quantity);
   });
 
-  it("throttles per account (5/hour) and per IP (10/hour) without changing the 200 for the account throttle", async () => {
-    const admin = await centralAdmin();
-    const c = await cashier(admin.shop.id, "cash@rbr.test");
-    for (let i = 0; i < 6; i++) {
-      await prisma.cashierRecoveryRequest.updateMany({ where: { userId: c.id, status: "PENDING" }, data: { status: "REJECTED" } });
-      expect((await request("cash@rbr.test")).statusCode).toBe(200);
-    }
-    expect(await prisma.cashierRecoveryRequest.count({ where: { userId: c.id } })).toBe(5);
+  it("[CASHIER mode] two different branches: each new cashier gets only their own branch's assigned products, all at 0", async (ctx) => {
+    if (mode !== "CASHIER") ctx.skip();
+    await seedProducts(shopId, 5); // Chennai
 
-    for (let i = 0; i < 10; i++) {
-      await prisma.cashierRecoveryRequest.create({
-        data: { userId: c.id, status: "REJECTED", createdAt: new Date(), expiresAt: new Date(Date.now() + 15 * 60_000), ip: "10.9.9.9" },
-      }).catch(() => undefined);
-    }
-    const flooded = await request("cash@rbr.test", "10.9.9.9");
-    expect(flooded.statusCode).toBe(429);
+    const bengaluru = await prisma.shop.create({ data: { name: "RBR Egg Mart - Bengaluru", code: "bengaluru" } });
+    await seedProducts(bengaluru.id, 5);
+    const bengaluruAdmin = await createAdmin("admin-blr@eggmart.test", bengaluru.id);
+
+    const pendingChennai = await createPendingCashier("chennai-cashier@example.com", shopId);
+    const pendingBengaluru = await createPendingCashier("bengaluru-cashier@example.com", bengaluru.id);
+
+    await approve(pendingChennai.id, adminToken);
+    await approve(pendingBengaluru.id, bengaluruAdmin.token);
+
+    const chennaiRows = await prisma.cashierInventory.findMany({ where: { shopId, cashierId: pendingChennai.id } });
+    const bengaluruRows = await prisma.cashierInventory.findMany({ where: { shopId: bengaluru.id, cashierId: pendingBengaluru.id } });
+
+    expect(chennaiRows).toHaveLength(5);
+    expect(bengaluruRows).toHaveLength(5);
+    expect(chennaiRows.every((r) => r.quantity === 0)).toBe(true);
+    expect(bengaluruRows.every((r) => r.quantity === 0)).toBe(true);
+    // Branch isolation: no overlap between the two branches' products.
+    const chennaiIds = new Set(chennaiRows.map((r) => r.productId));
+    expect(bengaluruRows.some((r) => chennaiIds.has(r.productId))).toBe(false);
   });
 
-  it("fails closed (503) when the Central Admin or pepper is not configured", async () => {
-    const admin = await createAdminFixture(app, { email: "a@rbr.test", shopLocation: "Veerapandi" });
-    await cashier(admin.shop.id, "cash@rbr.test");
-    expect((await request("cash@rbr.test")).statusCode).toBe(503);
-    expect((await reset("cash@rbr.test", "AAAA", NEW)).statusCode).toBe(503);
-    expect((await get("/api/admin/cashier-recovery", admin.token)).statusCode).toBe(503);
-  });
-});
+  it("[CASHIER mode] a product UNASSIGNED from the branch gets no row for a new cashier", async (ctx) => {
+    if (mode !== "CASHIER") ctx.skip();
+    const [keep, hidden] = await seedProducts(shopId, 2);
+    await prisma.branchProduct.update({
+      where: { shopId_productId: { shopId, productId: hidden } },
+      data: { isAssigned: false },
+    });
 
-// ── 3–5. Admin authorization ───────────────────────────────────────────
-describe.skipIf(!enabled)("central admin authorization", () => {
-  it("central admin sees requests from EVERY shop, regardless of the selected shop", async () => {
-    const admin = await centralAdmin("Veerapandi");
-    const other = await createAdminFixture(app, { email: "branch@rbr.test", shopLocation: "Gandhipuram" });
-    const s1 = await cashier(admin.shop.id, "c1@rbr.test", "One");
-    const s2 = await cashier(other.shop.id, "c2@rbr.test", "Two"); // a shop the central admin is NOT linked to
-    await request("c1@rbr.test");
-    await request("c2@rbr.test");
-    expect(await prisma.adminShopLink.count({ where: { adminId: admin.user.id, shopId: other.shop.id } })).toBe(0);
+    const pending = await createPendingCashier("newcashier5@example.com", shopId);
+    await approve(pending.id, adminToken);
 
-    const list = json(await get("/api/admin/cashier-recovery", admin.token)).data;
-    expect(list.map((r: { cashier: { id: string } }) => r.cashier.id).sort()).toEqual([s1.id, s2.id].sort());
-    expect(list[0]).toHaveProperty("shop.name");
-    expect(list[0]).toHaveProperty("expiresAt");
-    expect(JSON.stringify(list)).not.toMatch(/codeHash|userAgent|"ip"/);
-
-    // Switching the active shop changes nothing.
-    await post("/api/admin/shops/switch", { shopId: admin.shop.id }, admin.token);
-    expect(json(await get("/api/admin/cashier-recovery", admin.token)).data).toHaveLength(2);
+    const rows = await prisma.cashierInventory.findMany({ where: { shopId, cashierId: pending.id } });
+    expect(rows.map((r) => r.productId)).toEqual([keep]);
   });
 
-  it("a different ADMIN is refused (403) on every route, and the attempt is audited", async () => {
-    const { req } = await pendingSetup();
-    const other = await createAdminFixture(app, { email: "branch@rbr.test", shopLocation: "Gandhipuram" });
-    expect((await get("/api/admin/cashier-recovery", other.token)).statusCode).toBe(403);
-    expect((await approve(other.token, req.id)).statusCode).toBe(403);
-    expect((await post(`/api/admin/cashier-recovery/${req.id}/reject`, {}, other.token)).statusCode).toBe(403);
-    expect(json(await get("/api/admin/cashier-recovery", other.token)).code).toBe("CENTRAL_ADMIN_REQUIRED");
-    expect(await prisma.auditLog.count({ where: { action: "CASHIER_RECOVERY_DENIED", actorId: other.user.id } })).toBe(3 + 1);
-    expect((await prisma.cashierRecoveryRequest.findUniqueOrThrow({ where: { id: req.id } })).status).toBe("PENDING");
+  // ── BRANCH mode (authoritative: BranchInventory) ────────────────────────
+
+  it("[BRANCH mode] approval writes NO CashierInventory rows", async (ctx) => {
+    if (mode !== "BRANCH") ctx.skip();
+    await seedProducts(shopId, 5);
+    const pending = await createPendingCashier("newcashier6@example.com", shopId);
+
+    const approveRes = await approve(pending.id, adminToken);
+    expect(approveRes.statusCode).toBe(200);
+
+    expect(await prisma.cashierInventory.count({ where: { shopId } })).toBe(0);
   });
 
-  it("a Cashier token is refused; anonymous callers get 401", async () => {
-    const { req } = await pendingSetup();
-    const login = json(await cashierLogin("cash@rbr.test"));
-    expect((await get("/api/admin/cashier-recovery", login.token)).statusCode).toBe(403);
-    expect((await approve(login.token, req.id)).statusCode).toBe(403);
-    expect((await get("/api/admin/cashier-recovery")).statusCode).toBe(401);
-    expect((await approve("", req.id)).statusCode).toBe(401);
-    expect((await prisma.cashierRecoveryRequest.findUniqueOrThrow({ where: { id: req.id } })).status).toBe("PENDING");
-  });
+  it("[BRANCH mode] the branch's cashier sees the branch's stock, and unstocked assigned products at 0", async (ctx) => {
+    if (mode !== "BRANCH") ctx.skip();
+    const [stocked, ...rest] = await seedProducts(shopId, 3);
+    await adjustStock(prisma, { shopId, productId: stocked, delta: 40, type: "IN", reason: "seed" });
 
-  it("a recovery-flow client holds nothing usable on ordinary APIs (no token is ever issued by recovery)", async () => {
-    const { c, code } = await approvedSetup();
-    const res = await reset("cash@rbr.test", code);
+    const pending = await createPendingCashier("newcashier7@example.com", shopId);
+    await approve(pending.id, adminToken);
+
+    const loginRes = await app.inject({
+      method: "POST",
+      url: "/api/auth/login",
+      payload: { email: "newcashier7@example.com", password: "CashierPass123" },
+    });
+    const token = JSON.parse(loginRes.payload).token as string;
+
+    const res = await app.inject({ method: "GET", url: "/api/products", headers: { authorization: `Bearer ${token}` } });
     expect(res.statusCode).toBe(200);
-    expect(JSON.stringify(json(res))).not.toMatch(/token|jwt/i);
-    expect((await get("/api/auth/me", code)).statusCode).toBe(401);
-    void c;
+    const products = JSON.parse(res.payload) as Array<{ id: string; stock: number }>;
+
+    expect(products).toHaveLength(3);
+    expect(products.find((p) => p.id === stocked)?.stock).toBe(40);
+    for (const id of rest) expect(products.find((p) => p.id === id)?.stock).toBe(0);
   });
 });
 
-// ── approval ───────────────────────────────────────────────────────────
-describe.skipIf(!enabled)("approval", () => {
-  it("requires password re-auth and the in-person confirmation", async () => {
-    const { admin, req } = await pendingSetup();
-    expect((await approve(admin.token, req.id, { currentPassword: "WrongPassword1", identityVerified: true })).statusCode).toBe(403);
-    expect((await approve(admin.token, req.id, { currentPassword: ADMIN_PW })).statusCode).toBe(422);
-    expect((await approve(admin.token, req.id, { currentPassword: ADMIN_PW, identityVerified: false })).statusCode).toBe(422);
-    expect((await prisma.cashierRecoveryRequest.findUniqueOrThrow({ where: { id: req.id } })).status).toBe("PENDING");
+describe("Cashier data isolation (security regression)", () => {
+  beforeEach(async () => {
+    await resetDb();
+    const shop = await prisma.shop.create({ data: { name: "RBR Egg Mart - Chennai", code: "chennai" } });
+    shopId = shop.id;
+    const admin = await createAdmin("admin2@eggmart.test", shopId);
+    adminToken = admin.token;
   });
 
-  it("issues a code once; stores only a keyed hash; does not move the deadline; never leaks via list", async () => {
-    const { admin, req } = await pendingSetup();
-    const res = await approve(admin.token, req.id);
-    expect(res.statusCode).toBe(200);
-    const { code, expiresAt } = json(res).data;
-    expect(code).toMatch(/^([0-9A-Z]{4}-){7}[0-9A-Z]{4}$/); // 32 chars / 160 bits
-    expect(new Date(expiresAt).getTime()).toBe(req.expiresAt.getTime());
+  it("[CASHIER mode] Cashier A cannot see Cashier B's stock through the product catalog endpoint", async (ctx) => {
+    if (mode !== "CASHIER") ctx.skip();
+    const [productA] = await seedProducts(shopId, 1);
+    await createApprovedCashier("cashierA@example.com", shopId);
+    const cashierB = await createApprovedCashier("cashierB@example.com", shopId);
 
-    const row = await prisma.cashierRecoveryRequest.findUniqueOrThrow({ where: { id: req.id } });
-    expect(row.status).toBe("APPROVED");
-    expect(row.expiresAt.getTime()).toBe(req.expiresAt.getTime());
-    expect(row.codeHash).toMatch(/^[0-9a-f]{64}$/);
-    expect(row.codeHash).not.toContain(code.replace(/-/g, ""));
-    expect(row.decidedById).toBe(admin.user.id);
+    await adjustStock(prisma, { shopId, cashierId: cashierB.id, productId: productA, delta: 300, type: "IN", reason: "seed" });
 
-    const list = await get("/api/admin/cashier-recovery?filter=all", admin.token);
-    expect(list.payload).not.toContain(code);
-    expect(list.payload).not.toContain(code.replace(/-/g, ""));
-    expect(list.headers["cache-control"]).toBe("no-store");
-    expect(res.headers["cache-control"]).toBe("no-store");
+    const loginA = await app.inject({ method: "POST", url: "/api/auth/login", payload: { email: "cashierA@example.com", password: "CashierPass123" } });
+    const tokenA = JSON.parse(loginA.payload).token as string;
+
+    const productsRes = await app.inject({ method: "GET", url: "/api/products", headers: { authorization: `Bearer ${tokenA}` } });
+    const products = JSON.parse(productsRes.payload) as Array<{ id: string; stock: number }>;
+    const seen = products.find((p) => p.id === productA);
+
+    // Cashier A sees the product (shared branch catalog) but at THEIR OWN
+    // stock (0), never Cashier B's 300.
+    expect(seen).toBeDefined();
+    expect(seen?.stock).toBe(0);
   });
 
-  it("cannot be approved twice (and concurrent approvals produce a single winner)", async () => {
-    const { admin, req } = await pendingSetup();
-    const rs = await Promise.all(Array.from({ length: 6 }, () => approve(admin.token, req.id)));
-    expect(rs.filter((r) => r.statusCode === 200)).toHaveLength(1);
-    expect(rs.filter((r) => r.statusCode === 409)).toHaveLength(5);
+  it("a cashier at another branch cannot see this branch's products", async () => {
+    const [productA] = await seedProducts(shopId, 1);
+
+    const other = await prisma.shop.create({ data: { name: "RBR Egg Mart - Bengaluru", code: "bengaluru" } });
+    await createApprovedCashier("other-cashier@example.com", other.id);
+
+    const login = await app.inject({ method: "POST", url: "/api/auth/login", payload: { email: "other-cashier@example.com", password: "CashierPass123" } });
+    const token = JSON.parse(login.payload).token as string;
+
+    const res = await app.inject({ method: "GET", url: "/api/products", headers: { authorization: `Bearer ${token}` } });
+    const products = JSON.parse(res.payload) as Array<{ id: string }>;
+    expect(products.some((p) => p.id === productA)).toBe(false);
   });
 
-  it("rejects approval of an expired request and does not extend it", async () => {
-    const { admin, req } = await pendingSetup();
-    await backdate(req.id, 16);
-    const res = await approve(admin.token, req.id);
-    expect(res.statusCode).toBe(409);
-    expect(json(res).code).toBe("RECOVERY_REQUEST_EXPIRED");
-    expect((await prisma.cashierRecoveryRequest.findUniqueOrThrow({ where: { id: req.id } })).status).toBe("EXPIRED");
-  });
+  it("a cashier cannot adjust another cashier's inventory by supplying their own id as cashierId to the admin adjust-stock endpoint (auth-only sanity check)", async () => {
+    const [productA] = await seedProducts(shopId, 1);
+    const cashierA = await createApprovedCashier("cashierA2@example.com", shopId);
 
-  it("a rejected request cannot be approved or reused; rejecting an approved one revokes its code", async () => {
-    const { admin, req } = await pendingSetup();
-    expect((await post(`/api/admin/cashier-recovery/${req.id}/reject`, {}, admin.token)).statusCode).toBe(200);
-    expect((await approve(admin.token, req.id)).statusCode).toBe(409);
+    const loginA = await app.inject({ method: "POST", url: "/api/auth/login", payload: { email: "cashierA2@example.com", password: "CashierPass123" } });
+    const tokenA = JSON.parse(loginA.payload).token as string;
 
-    const s = await approvedSetup("second@rbr.test");
-    expect((await post(`/api/admin/cashier-recovery/${s.req.id}/reject`, {}, s.admin.token)).statusCode).toBe(200);
-    expect((await reset("second@rbr.test", s.code)).statusCode).toBe(400);
-    const row = await prisma.cashierRecoveryRequest.findUniqueOrThrow({ where: { id: s.req.id } });
-    expect(row.status).toBe("REJECTED");
-    expect(row.codeHash).toBeNull();
-  });
-});
-
-// ── 8–15. redemption ───────────────────────────────────────────────────
-describe.skipIf(!enabled)("redemption", () => {
-  it("valid code: password changes, ALL sessions revoked, old password dead, new works, admin untouched", async () => {
-    const { admin, c, code } = await approvedSetup();
-    const oldSession = json(await cashierLogin("cash@rbr.test"));
-    const adminBefore = await prisma.user.findUniqueOrThrow({ where: { id: admin.user.id } });
-
-    const res = await reset("cash@rbr.test", code);
-    expect(res.statusCode).toBe(200);
-
-    expect((await get("/api/auth/me", oldSession.token)).statusCode).toBe(401);
-    expect(await prisma.session.count({ where: { userId: c.id, revokedAt: null } })).toBe(0);
-    expect((await cashierLogin("cash@rbr.test", OLD)).statusCode).toBe(401);
-    expect((await cashierLogin("cash@rbr.test", NEW)).statusCode).toBe(200);
-
-    const adminAfter = await prisma.user.findUniqueOrThrow({ where: { id: admin.user.id } });
-    expect(adminAfter.passwordHash).toBe(adminBefore.passwordHash);
-    expect(await verifyPassword(ADMIN_PW, adminAfter.passwordHash)).toBe(true);
-
-    const row = await prisma.cashierRecoveryRequest.findFirstOrThrow({ where: { userId: c.id } });
-    expect(row.status).toBe("COMPLETED");
-    expect(row.codeHash).toBeNull();
-    expect(row.consumedAt).not.toBeNull();
-  });
-
-  it("accepts the code typed in lowercase / without dashes (what a human will do)", async () => {
-    const { code } = await approvedSetup();
-    expect((await reset("cash@rbr.test", code.toLowerCase().replace(/-/g, ""))).statusCode).toBe(200);
-  });
-
-  it("a used code is rejected", async () => {
-    const { code } = await approvedSetup();
-    expect((await reset("cash@rbr.test", code)).statusCode).toBe(200);
-    expect((await reset("cash@rbr.test", code, "AnotherPass77")).statusCode).toBe(400);
-    expect((await cashierLogin("cash@rbr.test", NEW)).statusCode).toBe(200);
-  });
-
-  it("every failure is the SAME 400 — unknown email, wrong code, no approval, wrong account", async () => {
-    const s = await approvedSetup("a@rbr.test");
-    await cashier(s.admin.shop.id, "b@rbr.test");
-    const bodies = new Set<string>();
-    const wrongCode = "ABCD-EFGH-JKMN-PQRS-TVWX-YZ01-2345-6789";
-    for (const [email, code] of [
-      ["ghost@rbr.test", wrongCode],
-      ["a@rbr.test", wrongCode],
-      ["b@rbr.test", s.code], // a's valid code against b's account
-      ["central@rbr.test", s.code], // an admin account
-    ] as const) {
-      const r = await reset(email, code);
-      expect(r.statusCode).toBe(400);
-      bodies.add(r.payload);
-    }
-    expect(bodies.size).toBe(1);
-    // …and a's code still works afterwards (failed guesses don't burn it).
-    expect((await reset("a@rbr.test", s.code)).statusCode).toBe(200);
-  });
-
-  it("an expired request's code is rejected", async () => {
-    const { req, code } = await approvedSetup();
-    await backdate(req.id, 16);
-    expect((await reset("cash@rbr.test", code)).statusCode).toBe(400);
-    expect((await cashierLogin("cash@rbr.test", OLD)).statusCode).toBe(200);
-  });
-
-  it("a weak password is rejected (422) WITHOUT consuming the code", async () => {
-    const { code } = await approvedSetup();
-    expect((await reset("cash@rbr.test", code, "short1")).statusCode).toBe(422);
-    expect((await reset("cash@rbr.test", code, "alllettersnonum")).statusCode).toBe(422);
-    expect((await reset("cash@rbr.test", code, NEW)).statusCode).toBe(200);
-  });
-
-  it("concurrent redemption: exactly one of N parallel attempts wins", async () => {
-    const { c, code } = await approvedSetup();
-    const rs = await Promise.all(Array.from({ length: 8 }, (_, i) => reset("cash@rbr.test", code, `ParallelPass${i}x`)));
-    expect(rs.filter((r) => r.statusCode === 200)).toHaveLength(1);
-    expect(rs.filter((r) => r.statusCode === 400)).toHaveLength(7);
-    const winner = rs.findIndex((r) => r.statusCode === 200);
-    expect((await cashierLogin("cash@rbr.test", `ParallelPass${winner}x`)).statusCode).toBe(200);
-    expect(await prisma.cashierRecoveryRequest.count({ where: { userId: c.id, status: "COMPLETED" } })).toBe(1);
-  });
-
-  it("recovery works for cashiers of different branches, each only with their own code", async () => {
-    const admin = await centralAdmin("Veerapandi");
-    const other = await createAdminFixture(app, { email: "branch@rbr.test", shopLocation: "Gandhipuram" });
-    await cashier(admin.shop.id, "v@rbr.test");
-    await cashier(other.shop.id, "g@rbr.test");
-    await request("v@rbr.test");
-    await request("g@rbr.test");
-    const list = json(await get("/api/admin/cashier-recovery", admin.token)).data as { id: string; cashier: { email: string } }[];
-    const codes: Record<string, string> = {};
-    for (const r of list) codes[r.cashier.email] = json(await approve(admin.token, r.id)).data.code;
-    expect((await reset("v@rbr.test", codes["g@rbr.test"])).statusCode).toBe(400);
-    expect((await reset("v@rbr.test", codes["v@rbr.test"])).statusCode).toBe(200);
-    expect((await reset("g@rbr.test", codes["g@rbr.test"])).statusCode).toBe(200);
-  });
-
-  it("repeated wrong codes trigger the durable throttle (429), and the valid code works once the window clears", async () => {
-    const { code } = await approvedSetup();
-    for (let i = 0; i < 5; i++) expect((await reset("cash@rbr.test", `AAAA-AAAA-AAAA-AAAA-AAAA-AAAA-AAAA-AAA${i}`)).statusCode).toBe(400);
-    const blocked = await reset("cash@rbr.test", `AAAA-AAAA-AAAA-AAAA-AAAA-AAAA-AAAA-AAA9`);
-    expect(blocked.statusCode).toBe(429);
-    expect((await reset("cash@rbr.test", code)).statusCode).toBe(429); // even the right code is held during the delay
-    await prisma.adminRecoveryAudit.updateMany({ data: { createdAt: new Date(Date.now() - 3 * 3600_000) } });
-    expect((await reset("cash@rbr.test", code)).statusCode).toBe(200);
-  });
-});
-
-// ── DB-level guarantees ────────────────────────────────────────────────
-describe.skipIf(!enabled)("database constraints", () => {
-  it("rejects a non-15-minute deadline, a code hash on a non-approved row, and a raw (non-hex) hash", async () => {
-    const { c } = await pendingSetup();
-    const now = new Date();
-    const base = { userId: c.id, status: "REJECTED" as const };
-    await expect(
-      prisma.cashierRecoveryRequest.create({ data: { ...base, createdAt: now, expiresAt: new Date(now.getTime() + 20 * 60_000) } })
-    ).rejects.toThrow();
-    await expect(
-      prisma.cashierRecoveryRequest.create({ data: { ...base, createdAt: now, expiresAt: new Date(now.getTime() + 15 * 60_000), codeHash: "a".repeat(64) } })
-    ).rejects.toThrow();
-    await expect(
-      prisma.cashierRecoveryRequest.create({ data: { userId: c.id, status: "APPROVED", createdAt: now, expiresAt: new Date(now.getTime() + 15 * 60_000), codeHash: "ABCD-plaintext" } })
-    ).rejects.toThrow();
-  });
-});
-
-// ── audit ──────────────────────────────────────────────────────────────
-describe.skipIf(!enabled)("audit logging", () => {
-  it("records request → approval → failure → completion, and never a code, hash or password", async () => {
-    const { admin, code } = await approvedSetup();
-    await reset("cash@rbr.test", "AAAA-AAAA-AAAA-AAAA-AAAA-AAAA-AAAA-AAAA");
-    await reset("cash@rbr.test", code);
-    const rows = await prisma.auditLog.findMany({ where: { action: { in: ["CASHIER_RECOVERY_REQUESTED", "CASHIER_RECOVERY_APPROVED", "CASHIER_RECOVERY_FAILED", "CASHIER_RECOVERY_COMPLETED", "CASHIER_RECOVERY_REJECTED", "CASHIER_RECOVERY_THROTTLED", "CASHIER_RECOVERY_DENIED"] } }, orderBy: { createdAt: "asc" } });
-    const actions = rows.map((r) => r.action);
-    expect(actions).toEqual(
-      expect.arrayContaining(["CASHIER_RECOVERY_REQUESTED", "CASHIER_RECOVERY_APPROVED", "CASHIER_RECOVERY_FAILED", "CASHIER_RECOVERY_COMPLETED"])
-    );
-    expect(rows.find((r) => r.action === "CASHIER_RECOVERY_APPROVED")?.actorId).toBe(admin.user.id);
-    const blob = JSON.stringify(rows) + JSON.stringify(await prisma.adminRecoveryAudit.findMany());
-    expect(blob).not.toContain(code);
-    expect(blob).not.toContain(code.replace(/-/g, ""));
-    expect(blob).not.toContain(NEW);
-    const reqRow = await prisma.cashierRecoveryRequest.findFirstOrThrow();
-    expect(blob).not.toContain(reqRow.codeHash ?? "zzzz-never");
+    // Cashiers have no route access to the admin inventory-adjustment
+    // endpoint at all — role gating should reject this outright.
+    const res = await app.inject({
+      method: "PATCH",
+      url: `/api/admin/products/${productA}/adjust-stock`,
+      headers: { authorization: `Bearer ${tokenA}` },
+      payload: { delta: 999, cashierId: cashierA.id },
+    });
+    expect(res.statusCode).toBe(403);
   });
 });

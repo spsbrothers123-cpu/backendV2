@@ -2,20 +2,18 @@
  * Integration tests for cashier shop assignment: invite → signup → approval
  * → login → authenticated shop scoping, plus Shop A vs Shop B isolation.
  *
- * RBR Egg Mart V2 Phase 1 (invitation code / branch-name rework): an
- * invitation code is now generic (never tied to any shop, never taken from
- * or displayed with the Global Shop Selector) and the shop a cashier joins
- * is resolved at signup time from the Branch Name they themselves type in
- * — see src/lib/shopAccess.ts resolveOrCreateShopByLocation and
- * src/routes/auth.ts POST /signup. This file replaces an earlier version
- * that asserted the opposite (invitation codes carrying an explicit target
- * shopId) — that was the bug this rework fixes.
+ * Contract (Phase 2, Stage 2.4): an invitation code is generic (never tied
+ * to a shop). The cashier SELECTS an existing branch at signup by sending
+ * its `shopId`; free-text branch names never create, find or choose a shop.
+ * One cashier per branch: a taken branch is refused and the invite is NOT
+ * consumed. Branch scoping of products/stock is via BranchProduct, not
+ * Product.shopId.
  *
  * Same constraints as the other test/*.integration.test.ts files — needs a
  * real Postgres database, excluded from the default sandboxed `npm test`
  * run:
  *
- *   1. Point DATABASE_URL (in .env) at a disposable Postgres database.
+ *   1. Point DATABASE_URL (in .env.test) at a disposable Postgres database.
  *   2. npx prisma migrate deploy
  *   3. RUN_INTEGRATION_TESTS=1 npx vitest run test/cashierShopAssignment.integration.test.ts
  */
@@ -25,6 +23,7 @@ import { buildApp } from "../src/app.js";
 import { prisma } from "../src/lib/prisma.js";
 import { resetDb } from "./dbReset.js";
 import { createAdminFixture } from "./adminFixture.js";
+import { createAssignedProduct, seedStock } from "./branchFixtures.js";
 
 let app: FastifyInstance;
 
@@ -96,14 +95,14 @@ async function inviteFor(token: string): Promise<InviteData> {
   return JSON.parse(res.payload).data as InviteData;
 }
 
-/** Full cashier lifecycle through the real HTTP API: verify code → signup (with
- * the given Branch Name) → admin approves → cashier logs in. Returns the
+/** Full cashier lifecycle through the real HTTP API: verify code → signup
+ * (SELECTING the given existing branch by id) → admin approves → cashier logs in. Returns the
  * cashier's token + login body. */
 async function onboardCashier(
   adminToken: string,
   code: string,
   email: string,
-  branchName: string,
+  branchShopId: string,
   extraSignupFields: Record<string, unknown> = {}
 ) {
   const verify = await app.inject({ method: "POST", url: "/api/auth/signup/verify-invitation", payload: { code } });
@@ -117,7 +116,7 @@ async function onboardCashier(
       name: email.split("@")[0],
       email,
       password: "Password123",
-      branchName,
+      shopId: branchShopId,
       verificationToken,
       ...extraSignupFields,
     },
@@ -230,72 +229,144 @@ describe("POST /api/admin/invitation-codes/:id/revoke", () => {
   });
 });
 
-// ── §2 Cashier signup assigns the shop resolved from Branch Name ────────
+// ── §2 Cashier signup SELECTS an existing branch ────────────────────────
 
-describe("Cashier signup resolves the shop from Branch Name", () => {
-  it("two cashiers signing up with the same code but different branch names end up in two different (auto-created) shops", async () => {
+/** Verify an invite and return the signup verification token. */
+async function verifyToken(code: string) {
+  const verify = await app.inject({ method: "POST", url: "/api/auth/signup/verify-invitation", payload: { code } });
+  expect(verify.statusCode).toBe(200);
+  return JSON.parse(verify.payload).verificationToken as string;
+}
+
+function rawSignup(payload: Record<string, unknown>) {
+  return app.inject({ method: "POST", url: "/api/auth/signup", payload });
+}
+
+describe("Cashier signup selects an existing branch", () => {
+  it("two cashiers with the same admin's codes select different branches and land in those two shops — no shop is created", async () => {
+    const { token, shopA, shopB } = await adminWithTwoShops();
+    const shopsBefore = await prisma.shop.count();
+
+    const c1 = await onboardCashier(token, (await inviteFor(token)).code, "cashier1@eggmart.test", shopA.id);
+    // A single-use code — mint a fresh one for the second cashier.
+    const c2 = await onboardCashier(token, (await inviteFor(token)).code, "cashier2@eggmart.test", shopB.id);
+
+    expect(c1.cashier.shop.id).toBe(shopA.id);
+    expect(c2.cashier.shop.id).toBe(shopB.id);
+    expect(c1.cashier.shop.id).not.toBe(c2.cashier.shop.id);
+    expect(await prisma.shop.count()).toBe(shopsBefore);
+  });
+
+  it("requires a shopId: a free-text branchName alone is rejected and creates no shop", async () => {
     const { token } = await adminWithTwoShops();
     const invite = await inviteFor(token);
+    const verificationToken = await verifyToken(invite.code);
+    const shopsBefore = await prisma.shop.count();
 
-    const c1 = await onboardCashier(token, invite.code, "cashier1@eggmart.test", "Coimbatore");
-    // A single-use code — mint a fresh one for the second cashier.
-    const invite2 = await inviteFor(token);
-    const c2 = await onboardCashier(token, invite2.code, "cashier2@eggmart.test", "RS Puram");
-
-    expect(c1.cashier.shop.name).toContain("Coimbatore");
-    expect(c2.cashier.shop.name).toContain("RS Puram");
-    expect(c1.cashier.shop.id).not.toBe(c2.cashier.shop.id);
+    const res = await rawSignup({
+      name: "typed",
+      email: "typed@eggmart.test",
+      password: "Password123",
+      branchName: "  veerapandi ",
+      verificationToken,
+    });
+    expect(res.statusCode).toBe(422);
+    expect(JSON.parse(res.payload).message).toContain("shopId");
+    expect(await prisma.shop.count()).toBe(shopsBefore);
   });
 
-  it("reuses an existing shop rather than creating a duplicate, and normalizes casing/whitespace", async () => {
-    const { token, shopA } = await adminWithTwoShops(); // shopA.location === "Veerapandi"
-    const invite = await inviteFor(token);
-
-    const c = await onboardCashier(token, invite.code, "cashier@eggmart.test", "  veerapandi ");
-    expect(c.cashier.shop.id).toBe(shopA.id);
-
-    const shopsNamedVeerapandi = await prisma.shop.count({ where: { location: { equals: "Veerapandi", mode: "insensitive" } } });
-    expect(shopsNamedVeerapandi).toBe(1);
-  });
-
-  it("ignores any shopId the cashier frontend tries to send at signup — only Branch Name decides the shop", async () => {
+  it("an extra free-text branchName is ignored: the selected shopId alone decides the shop", async () => {
     const { token, shopA } = await adminWithTwoShops();
     const invite = await inviteFor(token);
+    const shopsBefore = await prisma.shop.count();
 
-    // Cashier tries to sneak directly into shop A via a raw shopId while
-    // typing an unrelated branch name.
-    const c = await onboardCashier(token, invite.code, "sneaky@eggmart.test", "Brand New Branch", {
-      shopId: shopA.id,
+    // ASSUMPTION: the signup schema strips unknown keys (zod default). If it
+    // is .strict(), this returns 422 instead and the test should be dropped.
+    const c = await onboardCashier(token, invite.code, "sneaky@eggmart.test", shopA.id, {
+      branchName: "Brand New Branch",
     });
-    expect(c.cashier.shop.id).not.toBe(shopA.id);
-    expect(c.cashier.shop.name).toContain("Brand New Branch");
+    expect(c.cashier.shop.id).toBe(shopA.id);
+    expect(await prisma.shop.count()).toBe(shopsBefore);
+  });
+
+  it("an unknown shopId is rejected with BRANCH_NOT_FOUND and the invite stays ACTIVE", async () => {
+    const { token } = await adminWithTwoShops();
+    const invite = await inviteFor(token);
+    const verificationToken = await verifyToken(invite.code);
+
+    const res = await rawSignup({
+      name: "ghost",
+      email: "ghost@eggmart.test",
+      password: "Password123",
+      shopId: "00000000-0000-0000-0000-000000000000",
+      verificationToken,
+    });
+    expect(res.statusCode).toBe(404);
+    expect(JSON.parse(res.payload).code).toBe("BRANCH_NOT_FOUND");
+
+    const row = await prisma.invitationCode.findUniqueOrThrow({ where: { id: invite.id } });
+    expect(row.status).toBe("ACTIVE");
+  });
+
+  it("one cashier per branch: a branch that already has a cashier is refused and the invite is NOT consumed", async () => {
+    const { token, shopA, shopB } = await adminWithTwoShops();
+    await onboardCashier(token, (await inviteFor(token)).code, "first@eggmart.test", shopA.id);
+
+    const invite = await inviteFor(token);
+    const verificationToken = await verifyToken(invite.code);
+    const res = await rawSignup({
+      name: "second",
+      email: "second@eggmart.test",
+      password: "Password123",
+      shopId: shopA.id,
+      verificationToken,
+    });
+    // ASSUMPTION: 409. assertBranchCashierSlotFree (lib/branchCashier.ts) was
+    // not provided — adjust the status/code here if it differs.
+    expect(res.statusCode).toBe(409);
+
+    const row = await prisma.invitationCode.findUniqueOrThrow({ where: { id: invite.id } });
+    expect(row.status).toBe("ACTIVE");
+
+    // The same invite still works for a branch with no cashier.
+    const retry = await rawSignup({
+      name: "second",
+      email: "second@eggmart.test",
+      password: "Password123",
+      shopId: shopB.id,
+      verificationToken,
+    });
+    expect(retry.statusCode).toBe(201);
   });
 
   it("approval keeps the cashier's own shop no matter which shop the admin has selected at that moment", async () => {
     const { token, shopA, shopB } = await adminWithTwoShops();
 
     // Two cashiers sign up (approval deliberately NOT done yet): one for
-    // shop A's branch, one for shop B's.
-    async function signupOnly(email: string, branchName: string) {
+    // shop A, one for shop B.
+    async function signupOnly(email: string, branchShopId: string) {
       const invite = await inviteFor(token);
-      const verify = await app.inject({ method: "POST", url: "/api/auth/signup/verify-invitation", payload: { code: invite.code } });
-      expect(verify.statusCode).toBe(200);
-      const { verificationToken } = JSON.parse(verify.payload);
-      const signup = await app.inject({
-        method: "POST",
-        url: "/api/auth/signup",
-        payload: { name: email.split("@")[0], email, password: "Password123", branchName, verificationToken },
+      const verificationToken = await verifyToken(invite.code);
+      const signup = await rawSignup({
+        name: email.split("@")[0],
+        email,
+        password: "Password123",
+        shopId: branchShopId,
+        verificationToken,
       });
       expect(signup.statusCode).toBe(201);
       return JSON.parse(signup.payload).requestId as string;
     }
-    const requestA = await signupOnly("toA@eggmart.test", shopA.location);
-    const requestB = await signupOnly("toB@eggmart.test", shopB.location);
+    const requestA = await signupOnly("toA@eggmart.test", shopA.id);
+    const requestB = await signupOnly("toB@eggmart.test", shopB.id);
 
     async function selectShop(shopId: string) {
       const res = await app.inject({ method: "POST", url: "/api/admin/shops/switch", headers: auth(token), payload: { shopId } });
       expect(res.statusCode).toBe(200);
     }
+    // NOTE: if this fails with 404 on approve, that is the known gap in
+    // routes/admin/cashierRequests.ts (scopes to the active shop instead of
+    // every shop the admin owns) — a real backend bug, not a test problem.
     async function approve(requestId: string) {
       const res = await app.inject({ method: "POST", url: `/api/admin/cashier-requests/${requestId}/approve`, headers: auth(token) });
       expect(res.statusCode).toBe(200);
@@ -316,10 +387,10 @@ describe("Cashier signup resolves the shop from Branch Name", () => {
     expect(cashierB.shopId).toBe(shopB.id);
   });
 
-  it("an invite is single-use: a second signup with the same code is rejected", async () => {
-    const { token } = await adminWithTwoShops();
+  it("an invite is single-use: a second verification with the same code is rejected", async () => {
+    const { token, shopA } = await adminWithTwoShops();
     const invite = await inviteFor(token);
-    await onboardCashier(token, invite.code, "first@eggmart.test", "Peelamedu");
+    await onboardCashier(token, invite.code, "first@eggmart.test", shopA.id);
 
     const verify = await app.inject({ method: "POST", url: "/api/auth/signup/verify-invitation", payload: { code: invite.code } });
     expect(verify.statusCode).toBe(409);
@@ -331,19 +402,23 @@ describe("Cashier signup resolves the shop from Branch Name", () => {
 describe("Authenticated cashier scoping — Shop A vs Shop B", () => {
   async function twoCashiersWithData() {
     const { token, shopA, shopB } = await adminWithTwoShops();
-    const inviteA = await inviteFor(token);
-    const cashierA = await onboardCashier(token, inviteA.code, "cashier1@eggmart.test", shopA.location);
-    const inviteB = await inviteFor(token);
-    const cashierB = await onboardCashier(token, inviteB.code, "cashier2@eggmart.test", shopB.location);
+    const cashierA = await onboardCashier(token, (await inviteFor(token)).code, "cashier1@eggmart.test", shopA.id);
+    const cashierB = await onboardCashier(token, (await inviteFor(token)).code, "cashier2@eggmart.test", shopB.id);
 
+    // Each product is ASSIGNED to its own branch only (BranchProduct).
     const mk = (shopId: string, name: string, barcode: string) =>
-      prisma.product.create({
-        data: { shopId, name, category: "Egg", sellingPrice: 6, costPrice: 5, stock: 10, unit: "PIECE", lowStockThreshold: 1, barcode },
+      createAssignedProduct({
+        shopId, name, category: "Egg", sellingPrice: 6, costPrice: 5, stock: 10, unit: "PIECE", lowStockThreshold: 1, barcode,
       });
-    await mk(shopA.id, "Product only in A", "A-1");
-    await mk(shopB.id, "Product only in B", "B-1");
+    const productA = await mk(shopA.id, "Product only in A", "A-1");
+    const productB = await mk(shopB.id, "Product only in B", "B-1");
 
-    return { token, shopA, shopB, cashierA, cashierB };
+    // Stock in whichever table the active inventory mode reads (a zero-stock
+    // product can never enter a cart or be held).
+    await seedStock(shopA.id, cashierA.id, productA.id, 10);
+    await seedStock(shopB.id, cashierB.id, productB.id, 10);
+
+    return { token, shopA, shopB, cashierA, cashierB, productA, productB };
   }
 
   it("each cashier sees only their own shop's products", async () => {
@@ -405,15 +480,13 @@ describe("Authenticated cashier scoping — Shop A vs Shop B", () => {
   });
 
   it("hold-bill ignores a client shopId and bills into the cashier's own shop", async () => {
-    const { cashierA, shopA, shopB } = await twoCashiersWithData();
+    const { cashierA, shopA, shopB, productA, productB } = await twoCashiersWithData();
     await app.inject({
       method: "POST",
       url: "/api/sessions/start",
       headers: auth(cashierA.token),
       payload: { openingCash: 0 },
     });
-    const productA = await prisma.product.findFirstOrThrow({ where: { shopId: shopA.id } });
-    const productB = await prisma.product.findFirstOrThrow({ where: { shopId: shopB.id } });
 
     // A's product is billable…
     const held = await app.inject({

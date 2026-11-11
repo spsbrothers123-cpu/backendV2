@@ -14,6 +14,7 @@ import { prisma } from "../src/lib/prisma.js";
 import { checkoutBill } from "../src/services/billingService.js";
 import { collectPayment } from "../src/services/creditService.js";
 import { resetDb } from "./dbReset.js";
+import { createAssignedProduct, seedStock } from "./branchFixtures.js";
 
 let shopId: string;
 let cashierId: string;
@@ -39,14 +40,17 @@ beforeEach(async () => {
   });
   cashierId = cashier.id;
 
-  const product = await prisma.product.create({
-    data: { shopId, name: "Egg Tray", category: "Eggs", sellingPrice: 100, stock: 10, unit: "TRAY", lowStockThreshold: 2 },
+  // A product is billable only when ASSIGNED to the branch (BranchProduct);
+  // Product.shopId is legacy origin metadata and decides nothing.
+  const product = await createAssignedProduct({
+    shopId, name: "Egg Tray", category: "Eggs", sellingPrice: 100, stock: 10, unit: "TRAY", lowStockThreshold: 2,
   });
   productId = product.id;
 
-  // Stock is per-cashier now (cashier_inventories); products.stock is only the
-  // denormalized shop-wide sum. Seed this cashier's own row to match.
-  await prisma.cashierInventory.create({ data: { shopId, cashierId, productId, quantity: 10 } });
+  // Stock lives in the table the active inventory mode reads (CashierInventory
+  // in CASHIER mode, BranchInventory in BRANCH mode); products.stock is only
+  // the denormalized all-branch aggregate. Seed the authoritative row to match.
+  await seedStock(shopId, cashierId, productId, 10);
 
   // Billing only accepts a customer owned by the billing cashier (Phase 3).
   const customer = await prisma.customer.create({ data: { shopId, cashierId, name: "Test Customer", phone: "9990001111" } });

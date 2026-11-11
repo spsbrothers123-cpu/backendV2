@@ -2,16 +2,17 @@
  * Integration tests for cashier signup → invitation code → admin approval
  * → login.
  *
- * These hit the real Fastify app + a real Postgres database via Prisma, so
- * unlike test/invitationCode.test.ts and test/password.test.ts they are NOT
- * run as part of the default sandboxed build. To run them locally:
+ * Contract under test (Phase 2, Stage 2.4):
+ *   - The cashier SELECTS an existing branch; signup sends `shopId`.
+ *   - Free-text branch names are never accepted and never create a shop.
+ *   - One cashier per branch; a taken branch leaves the invite ACTIVE.
  *
- *   1. Point DATABASE_URL (in .env) at a disposable Postgres database.
+ * These hit the real Fastify app + a real Postgres database via Prisma. To
+ * run locally:
+ *
+ *   1. Point DATABASE_URL (in .env.test) at a disposable Postgres database.
  *   2. npx prisma migrate deploy
  *   3. RUN_INTEGRATION_TESTS=1 npx vitest run test/auth.integration.test.ts
- *
- * Covers Backend spec §28 (signup+invitation-code, approval, login,
- * multi-cashier, single-use enforcement, shop isolation).
  */
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
@@ -77,8 +78,24 @@ async function generateInvitationCode() {
 }
 
 async function verifyInvitation(code: string) {
-  const res = await app.inject({ method: "POST", url: "/api/auth/signup/verify-invitation", payload: { code } });
-  return res;
+  return app.inject({ method: "POST", url: "/api/auth/signup/verify-invitation", payload: { code } });
+}
+
+/** Full signup payload under the current contract: the branch is SELECTED
+ * by id (`shopId`). Overrides let a test remove or change any field. */
+function signupPayload(verificationToken: string, overrides: Record<string, unknown> = {}) {
+  return {
+    name: "John Doe",
+    email: "john@example.com",
+    password: "password123",
+    shopId,
+    verificationToken,
+    ...overrides,
+  };
+}
+
+async function signup(payload: Record<string, unknown>) {
+  return app.inject({ method: "POST", url: "/api/auth/signup", payload });
 }
 
 describe("Cashier signup → invitation code → approval → login", () => {
@@ -92,12 +109,8 @@ describe("Cashier signup → invitation code → approval → login", () => {
     const { verificationToken } = JSON.parse(verifyRes.payload);
     expect(verificationToken).toBeTruthy();
 
-    // 3. Cashier registers.
-    const signupRes = await app.inject({
-      method: "POST",
-      url: "/api/auth/signup",
-      payload: { name: "John Doe", email: "john@example.com", password: "password123", branchName: "Test Branch", verificationToken },
-    });
+    // 3. Cashier registers, selecting an existing branch by id.
+    const signupRes = await signup(signupPayload(verificationToken));
     expect(signupRes.statusCode).toBe(201);
     const { requestId, email } = JSON.parse(signupRes.payload);
     expect(email).toBe("john@example.com");
@@ -139,11 +152,8 @@ describe("Cashier signup → invitation code → approval → login", () => {
     expect(body.token).toBeTruthy();
     expect(body.cashier.active).toBe(true);
 
-    // The cashier's shop comes from the Branch Name they typed at signup
-    // ("Test Branch"), NOT from the admin's shop the invitation code was
-    // generated under ("Test Shop") — a code is no longer shop-scoped.
-    expect(body.cashier.shop.id).not.toBe(shopId);
-    expect(body.cashier.shop.name).toContain("Test Branch");
+    // The cashier's shop is exactly the branch they selected at signup.
+    expect(body.cashier.shop.id).toBe(shopId);
   });
 
   it("rejects an invalid invitation code", async () => {
@@ -177,23 +187,81 @@ describe("Cashier signup → invitation code → approval → login", () => {
   });
 
   it("rejects registration with a tampered/invalid verification token", async () => {
-    const res = await app.inject({
-      method: "POST",
-      url: "/api/auth/signup",
-            payload: { name: "Eve", email: "eve@example.com", password: "password123", branchName: "Test Branch", verificationToken: "not-a-real-token" },
-    });
+    const res = await signup(
+      signupPayload("not-a-real-token", { name: "Eve", email: "eve@example.com" })
+    );
     expect(res.statusCode).toBe(401);
     expect(JSON.parse(res.payload).code).toBe("INVITATION_VERIFICATION_INVALID");
+  });
+
+  // ── Stage 2.4 contract: branch is selected by id, never typed ─────────
+
+  it("requires a shopId — a free-text branchName alone is rejected at validation", async () => {
+    const { code } = await generateInvitationCode();
+    const { verificationToken } = JSON.parse((await verifyInvitation(code)).payload);
+
+    const payload = signupPayload(verificationToken);
+    delete (payload as Record<string, unknown>).shopId;
+    const res = await signup({ ...payload, branchName: "Some Typed Branch" });
+
+    expect(res.statusCode).toBe(422);
+    expect(JSON.parse(res.payload).message).toContain("shopId");
+    // Nothing was created, and no shop was created from the typed text.
+    expect(await prisma.shop.count()).toBe(1);
+  });
+
+  it("rejects an unknown branch with BRANCH_NOT_FOUND and leaves the invitation ACTIVE", async () => {
+    const { code, id } = await generateInvitationCode();
+    const { verificationToken } = JSON.parse((await verifyInvitation(code)).payload);
+
+    const res = await signup(
+      signupPayload(verificationToken, { shopId: "00000000-0000-0000-0000-000000000000" })
+    );
+    expect(res.statusCode).toBe(404);
+    expect(JSON.parse(res.payload).code).toBe("BRANCH_NOT_FOUND");
+
+    const invite = await prisma.invitationCode.findUniqueOrThrow({ where: { id } });
+    expect(invite.status).toBe("ACTIVE");
+  });
+
+  it("refuses a branch that already has a cashier, and the invitation stays ACTIVE for another branch", async () => {
+    // One cashier per branch: occupy the branch first.
+    await prisma.user.create({
+      data: {
+        name: "Occupant",
+        email: "occupant@example.com",
+        passwordHash: "irrelevant",
+        role: "CASHIER",
+        status: "ACTIVE",
+        shopId,
+      },
+    });
+
+    const { code, id } = await generateInvitationCode();
+    const { verificationToken } = JSON.parse((await verifyInvitation(code)).payload);
+
+    const res = await signup(signupPayload(verificationToken));
+    // NOTE: 409 assumed — assertBranchCashierSlotFree (lib/branchCashier.ts)
+    // was not provided. If it uses another status/code, adjust here.
+    expect(res.statusCode).toBe(409);
+
+    // The transaction rolled back: the invite is NOT consumed.
+    const invite = await prisma.invitationCode.findUniqueOrThrow({ where: { id } });
+    expect(invite.status).toBe("ACTIVE");
+
+    // ...so the same code can still register a cashier at a free branch.
+    const freeBranch = await prisma.shop.create({ data: { name: "Free Branch", code: "FREE" } });
+    const retry = await signup(signupPayload(verificationToken, { shopId: freeBranch.id }));
+    expect(retry.statusCode).toBe(201);
   });
 
   it("rejects a non-admin attempting to approve a request", async () => {
     const { code } = await generateInvitationCode();
     const { verificationToken } = JSON.parse((await verifyInvitation(code)).payload);
-    const signupRes = await app.inject({
-      method: "POST",
-      url: "/api/auth/signup",
-      payload: { name: "Jane Doe", email: "jane@example.com", password: "password123", verificationToken },
-    });
+    const signupRes = await signup(
+      signupPayload(verificationToken, { name: "Jane Doe", email: "jane@example.com" })
+    );
+    expect(signupRes.statusCode).toBe(201);
     const { requestId } = JSON.parse(signupRes.payload);
 
     const res = await app.inject({
@@ -210,6 +278,8 @@ describe("Cashier signup → invitation code → approval → login", () => {
   });
 
   it("supports multiple independent cashier accounts on the same shop", async () => {
+    // Direct inserts (legacy data shape): this checks session independence
+    // between accounts, not the signup flow's one-cashier-per-branch rule.
     const cashiers: Array<{ name: string; email: string }> = [
       { name: "Cashier A", email: "a@example.com" },
       { name: "Cashier B", email: "b@example.com" },
@@ -260,11 +330,9 @@ describe("Cashier signup → invitation code → approval → login", () => {
     const { code } = await generateInvitationCode();
     const { verificationToken } = JSON.parse((await verifyInvitation(code)).payload);
 
-    const res = await app.inject({
-      method: "POST",
-      url: "/api/auth/signup",
-            payload: { name: "Existing", email: "existing@example.com", password: "password123", branchName: "Test Branch", verificationToken },
-    });
+    const res = await signup(
+      signupPayload(verificationToken, { name: "Existing", email: "existing@example.com" })
+    );
     expect(res.statusCode).toBe(409);
     expect(JSON.parse(res.payload).code).toBe("ACCOUNT_ALREADY_EXISTS");
   });

@@ -19,6 +19,7 @@ import { hashPassword } from "../src/lib/password.js";
 import { checkoutBill } from "../src/services/billingService.js";
 import { resetDb } from "./dbReset.js";
 import { createAdminFixture } from "./adminFixture.js";
+import { createAssignedProduct, seedStock } from "./branchFixtures.js";
 
 let app: FastifyInstance;
 
@@ -339,19 +340,18 @@ describe("Cashier shop isolation (spec §3–6): shopId is always server-derived
 
   it("a bill checked out by a cashier is always associated with the cashier's own shop, and cannot reference another shop's product", async () => {
     const { veerapandi, gandhipuram } = await twoShopAdminWithCashiers();
-    const veerapandiProduct = await prisma.product.create({
-      data: { shopId: veerapandi.id, name: "Egg Tray", category: "Eggs", sellingPrice: 100, stock: 10, unit: "TRAY", lowStockThreshold: 2 },
+    // Each product is ASSIGNED to its own branch only (BranchProduct).
+    const veerapandiProduct = await createAssignedProduct({
+      shopId: veerapandi.id, name: "Egg Tray", category: "Eggs", sellingPrice: 100, stock: 10, unit: "TRAY", lowStockThreshold: 2,
     });
-    const gandhipuramProduct = await prisma.product.create({
-      data: { shopId: gandhipuram.id, name: "Egg Carton", category: "Eggs", sellingPrice: 60, stock: 10, unit: "PIECE", lowStockThreshold: 2 },
+    const gandhipuramProduct = await createAssignedProduct({
+      shopId: gandhipuram.id, name: "Egg Carton", category: "Eggs", sellingPrice: 60, stock: 10, unit: "PIECE", lowStockThreshold: 2,
     });
     const arunSession = await prisma.cashierSession.create({
       data: { cashierId: (await prisma.user.findUniqueOrThrow({ where: { email: "arun@rbr.test" } })).id, shopId: veerapandi.id, openingCash: 1000 },
     });
-    // Stock is per-cashier: give Arun his own inventory row for his shop's product.
-    await prisma.cashierInventory.create({
-      data: { shopId: veerapandi.id, cashierId: arunSession.cashierId, productId: veerapandiProduct.id, quantity: 10 },
-    });
+    // Seed stock in the table the active inventory mode reads.
+    await seedStock(veerapandi.id, arunSession.cashierId, veerapandiProduct.id, 10);
 
     // Arun (Veerapandi) can bill his own shop's product.
     const bill = (await checkoutBill({
@@ -385,8 +385,8 @@ describe("Cashier shop isolation (spec §3–6): shopId is always server-derived
 describe("Full data isolation across shops (spec §7/§8)", () => {
   it("products, customers, and bills never leak across shops for the same admin's two shops", async () => {
     const { token, veerapandi, gandhipuram } = await twoShopAdminWithCashiers();
-    await prisma.product.create({ data: { shopId: veerapandi.id, name: "V-Only Product", category: "Eggs", sellingPrice: 10, stock: 5, unit: "PIECE", lowStockThreshold: 1 } });
-    await prisma.product.create({ data: { shopId: gandhipuram.id, name: "G-Only Product", category: "Eggs", sellingPrice: 10, stock: 5, unit: "PIECE", lowStockThreshold: 1 } });
+    await createAssignedProduct({ shopId: veerapandi.id, name: "V-Only Product", category: "Eggs", sellingPrice: 10, stock: 5, unit: "PIECE", lowStockThreshold: 1 });
+    await createAssignedProduct({ shopId: gandhipuram.id, name: "G-Only Product", category: "Eggs", sellingPrice: 10, stock: 5, unit: "PIECE", lowStockThreshold: 1 });
 
     await switchShop(token, veerapandi.id);
     let res = await app.inject({ method: "GET", url: "/api/admin/products", headers: { authorization: `Bearer ${token}` } });
