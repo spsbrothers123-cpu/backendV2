@@ -19,7 +19,8 @@ const envSchema = z.object({
   DATABASE_URL: z.string().min(1, "DATABASE_URL is required"),
 
   JWT_SECRET: z.string().min(16, "JWT_SECRET must be at least 16 characters"),
-  JWT_EXPIRES_IN: z.string().default("12h"),
+    JWT_EXPIRES_IN: z.string().default("12h"),
+  PASSWORD_RESET_TOKEN_EXPIRY_MINUTES: z.coerce.number().int().positive().default(30),
 
   CORS_ORIGINS: z.string().default("http://localhost:5173,http://localhost:5174"),
 
