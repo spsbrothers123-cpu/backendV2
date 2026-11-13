@@ -21,7 +21,10 @@ export function isConfiguredCentralAdminId(userId: string): boolean {
   const configured = env.CENTRAL_ADMIN_USER_ID;
   return !!configured && configured.toLowerCase() === userId.toLowerCase();
 }
-
+export function getCentralAdminUserId(): string | null {
+  const configured = env.CENTRAL_ADMIN_USER_ID;
+  return configured ? configured : null;
+}
 export function assertCentralAdmin(user: AuthenticatedUser | undefined): asserts user is AuthenticatedUser {
   if (!env.CENTRAL_ADMIN_USER_ID) {
     throw new AppError(

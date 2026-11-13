@@ -81,6 +81,19 @@ const envSchema = z.object({
   // refused. Controls how request.ip is derived from X-Forwarded-For, which
   // the recovery throttle, rate limiter and audit trail depend on.
   TRUST_PROXY: optionalString(),
+
+  // ── Notification engine (Backend Phase 3) ───────────────────────────
+  // In-process scheduler (D-24). Defaults ON outside tests; set "false" to
+  // run an instance as API-only. Safe with several instances (DB lock).
+  NOTIFICATION_SCHEDULER_ENABLED: z.preprocess(
+    (v) => (typeof v === "string" && v.trim() === "" ? undefined : v),
+    z.enum(["true", "false"]).optional()
+  ).transform((v) => (v === undefined ? undefined : v === "true")),
+  // D-25: push (FCM/Capacitor) is deferred; this flag exists for B3.8. Default off.
+  NOTIFICATION_PUSH_ENABLED: z.preprocess(
+    (v) => (typeof v === "string" && v.trim() === "" ? undefined : v),
+    z.enum(["true", "false"]).optional()
+  ).transform((v) => v === "true"),
 });
 
 const parsed = envSchema.safeParse(process.env);

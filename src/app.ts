@@ -33,6 +33,11 @@ import adminReportsRoutes from "./routes/admin/reports.js";
 import adminHistoryRoutes from "./routes/admin/history.js";
 import adminDashboardRoutes from "./routes/admin/dashboard.js";
 import adminNotificationsRoutes from "./routes/admin/notifications.js";
+import adminNotificationSettingsRoutes from "./routes/admin/notificationSettings.js";
+import cashierNotificationsRoutes from "./routes/notifications.js";
+import adminAnnouncementsRoutes from "./routes/admin/announcements.js";
+import adminDailySummariesRoutes from "./routes/admin/dailySummaries.js";
+import branchNotificationSettingsRoutes from "./routes/admin/branchNotificationSettings.js";
 import adminProfileRoutes from "./routes/admin/profile.js";
 import adminSearchRoutes from "./routes/admin/search.js";
 import adminSettingsRoutes from "./routes/admin/settings.js";
@@ -95,6 +100,8 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(sessionsRoutes, { prefix: "/api/sessions" });
   await app.register(billsRoutes, { prefix: "/api/bills" });
   await app.register(reportsRoutes, { prefix: "/api/reports" });
+  // Phase 3 — Cashier notifications (bare path, per the Cashier contract).
+  await app.register(cashierNotificationsRoutes, { prefix: "/api/notifications" });
 
   // Phase 2 — Admin app
   await app.register(adminProductsRoutes, { prefix: "/api/admin/products" });
@@ -108,6 +115,11 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(adminHistoryRoutes, { prefix: "/api/admin/history" });
   await app.register(adminDashboardRoutes, { prefix: "/api/admin/dashboard" });
   await app.register(adminNotificationsRoutes, { prefix: "/api/admin/notifications" });
+  // Phase 3 (D-27): notification settings — Central Admin; Security locked ON.
+  await app.register(adminNotificationSettingsRoutes, { prefix: "/api/admin/notification-settings" });
+  await app.register(branchNotificationSettingsRoutes, { prefix: "/api/admin/notification-branch-settings" });
+  await app.register(adminAnnouncementsRoutes, { prefix: "/api/admin/announcements" });
+  await app.register(adminDailySummariesRoutes, { prefix: "/api/admin/daily-summaries" });
   await app.register(adminProfileRoutes, { prefix: "/api/admin/profile" });
   await app.register(adminSearchRoutes, { prefix: "/api/admin/search" });
   await app.register(adminSettingsRoutes, { prefix: "/api/admin/settings" });
