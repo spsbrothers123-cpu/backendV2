@@ -49,6 +49,16 @@ export async function resetDb() {
     prisma.cashierSession.deleteMany(),
 
     prisma.notification.deleteMany(),
+    // Phase 3 notification engine (all new tables; recipients cascade from notifications/users)
+    prisma.appNotificationRecipient.deleteMany(),
+    prisma.appNotification.deleteMany(),
+    prisma.announcement.deleteMany(),
+    prisma.notificationPreference.deleteMany(),
+    prisma.branchProductLowStock.deleteMany(),
+    prisma.branchNotificationSettings.deleteMany(),
+    prisma.notificationStockState.deleteMany(),
+    prisma.notificationJobState.deleteMany(),
+    prisma.dailySummary.deleteMany(),
     prisma.expense.deleteMany(),
 
     // CashierInventory has FKs to product, cashier (User), and shop —

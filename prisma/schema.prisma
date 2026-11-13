@@ -199,6 +199,9 @@ model Shop {
   expenses         Expense[]
   billCounters     BillCounter[]
   notifications    Notification[]
+  appNotifications AppNotification[]
+  notificationSettings BranchNotificationSettings?
+  productLowStock  BranchProductLowStock[]
   settings         ShopSettings?
   invitationCodes  InvitationCode[]
 
@@ -418,6 +421,11 @@ model User {
   expensesCreated     Expense[]
   creditTxnsActed     CreditTransaction[]
 
+  appNotificationRecipients AppNotificationRecipient[]
+  notificationPreferences   NotificationPreference[]
+  announcementsCreated      Announcement[] @relation("AnnouncementCreator")
+  announcementsTargeted     Announcement[] @relation("AnnouncementTarget")
+
   @@index([role, status])
   @@index([shopId])
   @@map("users")
@@ -503,6 +511,7 @@ model Product {
   branchProducts    BranchProduct[]
   branchInventories BranchInventory[]
   purchaseItems     PurchaseItem[]
+  branchLowStock    BranchProductLowStock[]
 
   @@index([shopId, status])
   @@index([shopId, category])
@@ -1267,4 +1276,217 @@ model CashierRecoveryRequest {
   @@index([status, expiresAt])
   @@index([ip, createdAt])
   @@map("cashier_recovery_requests")
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════
+// BACKEND PHASE 3 — Notification engine (B3.1). ALL NEW TABLES (D-26): the
+// legacy `notifications` table / `Notification` model above is untouched.
+// ═══════════════════════════════════════════════════════════════════════
+
+enum NtfCategory {
+  INVENTORY
+  CASHIER
+  CREDIT
+  SALES_PURCHASES
+  SECURITY
+  DAILY_SUMMARY
+  SESSION
+  ACCOUNT_SECURITY
+  ANNOUNCEMENT
+}
+
+enum NtfSeverity {
+  INFO
+  WARNING
+  CRITICAL
+}
+
+enum NtfStockState {
+  OK
+  LOW
+  OUT
+}
+
+enum AnnouncementAudience {
+  ALL_CASHIERS
+  INDIVIDUAL
+}
+
+enum DailySummaryKind {
+  MAIN
+  SUPPLEMENTARY
+}
+
+// One row per notification EVENT. `dedupeKey` is the database-backed
+// idempotency key: a retried/duplicated detector insert is a no-op.
+// Per-user state (read / acknowledged / deleted) lives on the recipient row.
+model AppNotification {
+  id        String          @id @default(uuid())
+  dedupeKey String          @unique
+  category  NtfCategory
+  type      String
+  severity  NtfSeverity     @default(INFO)
+  title     String
+  message   String
+
+  shopId    String?
+  shop      Shop?           @relation(fields: [shopId], references: [id], onDelete: SetNull)
+
+  targetKind  String?
+  targetId    String?
+  targetRoute String?
+
+  announcementId String?
+  announcement   Announcement? @relation(fields: [announcementId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+  // createdAt + 90 days (D-10). Deletion markers live exactly as long.
+  expiresAt DateTime
+
+  recipients AppNotificationRecipient[]
+
+  @@index([shopId, createdAt])
+  @@index([expiresAt])
+  @@index([announcementId])
+  @@map("app_notifications")
+}
+
+// Per-user delivery + state. readAt / acknowledgedAt are independent (D-11).
+// deletedAt is the deletion marker (kept until the notification expires, D-10).
+model AppNotificationRecipient {
+  id             String          @id @default(uuid())
+  notificationId String
+  notification   AppNotification @relation(fields: [notificationId], references: [id], onDelete: Cascade)
+  userId         String
+  user           User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Copy of the event's createdAt so list/cursor queries use one index.
+  createdAt      DateTime
+  readAt         DateTime?
+  acknowledgedAt DateTime?
+  deletedAt      DateTime?
+
+  @@unique([notificationId, userId])
+  @@index([userId, createdAt(sort: Desc), id])
+  @@map("app_notification_recipients")
+}
+
+// Per-user, per-category on/off switch (D-27). Locked categories are
+// enforced in code and by the API; no row can switch them off.
+model NotificationPreference {
+  id        String      @id @default(uuid())
+  userId    String
+  user      User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  category  NtfCategory
+  enabled   Boolean     @default(true)
+  updatedAt DateTime    @default(now()) @updatedAt
+
+  @@unique([userId, category])
+  @@map("notification_preferences")
+}
+
+// Admin-composed announcements (D-21). Content is immutable once inserted
+// (DB trigger); corrections are a NEW row pointing at the one it supersedes.
+model Announcement {
+  id        String               @id @default(uuid())
+  title     String
+  body      String
+  audience  AnnouncementAudience
+  targetCashierId String?
+  targetCashier   User?          @relation("AnnouncementTarget", fields: [targetCashierId], references: [id], onDelete: SetNull)
+  requiresAcknowledgement Boolean @default(false)
+
+  createdById String?
+  createdBy   User?    @relation("AnnouncementCreator", fields: [createdById], references: [id], onDelete: SetNull)
+  createdAt   DateTime @default(now())
+
+  supersedesId  String?       @unique
+  supersedes    Announcement? @relation("AnnouncementRevision", fields: [supersedesId], references: [id], onDelete: SetNull)
+  supersededBy  Announcement? @relation("AnnouncementRevision")
+  supersededAt  DateTime?
+
+  notifications AppNotification[]
+
+  @@index([createdAt])
+  @@map("announcements")
+}
+
+// Branch-level notification configuration (D-17, D-18, D-19 overrides).
+// Every column is nullable: NULL = "use the global default".
+model BranchNotificationSettings {
+  id      String @id @default(uuid())
+  shopId  String @unique
+  shop    Shop   @relation(fields: [shopId], references: [id], onDelete: Cascade)
+
+  // "HH:MM" in IST (D-18).
+  openingTime String?
+  closingTime String?
+  highValueSaleThreshold Decimal? @db.Decimal(12, 2)
+  largeCreditThreshold   Decimal? @db.Decimal(12, 2)
+  creditOverdueDays      Int?
+
+  updatedById String?
+  updatedAt   DateTime @default(now()) @updatedAt
+
+  @@map("branch_notification_settings")
+}
+
+// Branch override of Product.lowStockThreshold (D-17).
+model BranchProductLowStock {
+  id        String  @id @default(uuid())
+  shopId    String
+  shop      Shop    @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  productId String
+  product   Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+  lowStockThreshold Int
+  updatedAt DateTime @default(now()) @updatedAt
+
+  @@unique([shopId, productId])
+  @@map("branch_product_low_stock")
+}
+
+// Last observed stock state per (branch, product): makes stock alerts fire
+// once per TRANSITION, and survive restarts (D-23, D-24).
+model NotificationStockState {
+  id        String        @id @default(uuid())
+  shopId    String
+  productId String
+  state     NtfStockState
+  seq       Int           @default(1)
+  updatedAt DateTime      @default(now()) @updatedAt
+
+  @@unique([shopId, productId])
+  @@map("notification_stock_states")
+}
+
+// Scheduler lock + sweep watermark, one row per job (D-24).
+model NotificationJobState {
+  key           String    @id
+  lockedBy      String?
+  lockedUntil   DateTime?
+  lastStartedAt DateTime?
+  lastSuccessAt DateTime?
+  lastError     String?
+  failureCount  Int       @default(0)
+  cursorAt      DateTime?
+  updatedAt     DateTime  @default(now()) @updatedAt
+
+  @@map("notification_job_state")
+}
+
+// Stored daily summaries (D-22). MAIN = 12 AM-10 PM IST (generated 10 PM);
+// SUPPLEMENTARY = 10 PM-12 AM IST (generated 12:05 AM next day).
+model DailySummary {
+  id           String           @id @default(uuid())
+  businessDate String
+  kind         DailySummaryKind
+  windowStart  DateTime
+  windowEnd    DateTime
+  generatedAt  DateTime         @default(now())
+  metrics      Json
+  branches     Json
+
+  @@unique([businessDate, kind])
+  @@map("daily_summaries")
 }
